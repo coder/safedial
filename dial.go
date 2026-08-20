@@ -14,9 +14,41 @@ type ContextDialer interface {
 	DialContext(ctx context.Context, network, addr string) (net.Conn, error)
 }
 
+// defaultDialTimeout mirrors http.DefaultTransport's 30 second dialer
+// timeout.
+const defaultDialTimeout = 30 * time.Second
+
+// defaultDialer mirrors http.DefaultTransport's dialer settings so guarded
+// defaults keep the standard connect timeout and keep-alive.
+func defaultDialer() *net.Dialer {
+	return &net.Dialer{
+		Timeout:   defaultDialTimeout,
+		KeepAlive: 30 * time.Second,
+	}
+}
+
+// withDefaultTimeout bounds the whole dial operation, including DNS
+// resolution, when the caller supplies no deadline. net.Dialer.Timeout
+// bounds each connect attempt but not resolution.
+func withDefaultTimeout(
+	next func(ctx context.Context, network, addr string) (net.Conn, error),
+) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if _, ok := ctx.Deadline(); !ok {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, defaultDialTimeout)
+			defer cancel()
+		}
+		return next(ctx, network, addr)
+	}
+}
+
 // NewDialContext returns a DialContext function that validates every
 // destination against the policy before connecting through base. A nil base
-// uses a zero net.Dialer. Only tcp, tcp4, and tcp6 networks are permitted.
+// uses a dialer with http.DefaultTransport's timeout and keep-alive, and
+// additionally bounds the whole operation, resolution included, by that
+// timeout when the caller's context has no deadline. Only tcp, tcp4, and
+// tcp6 networks are permitted.
 //
 // Hostnames are resolved first and each resolved address is validated; the
 // connection is then made to a validated IP directly, so a hostile resolver
@@ -30,12 +62,15 @@ func NewDialContext(base ContextDialer, opts ...Option) func(ctx context.Context
 }
 
 func (c *config) dialFunc(base ContextDialer) func(ctx context.Context, network, addr string) (net.Conn, error) {
-	if base == nil {
-		base = &net.Dialer{}
+	if base != nil {
+		return func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return c.dial(ctx, base, network, addr)
+		}
 	}
-	return func(ctx context.Context, network, addr string) (net.Conn, error) {
-		return c.dial(ctx, base, network, addr)
-	}
+	dialer := defaultDialer()
+	return withDefaultTimeout(func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return c.dial(ctx, dialer, network, addr)
+	})
 }
 
 func (c *config) dial(

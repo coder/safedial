@@ -560,6 +560,50 @@ func TestDialContextIPv6Zone(t *testing.T) {
 	}
 }
 
+func TestDefaultDialerMirrorsDefaultTransport(t *testing.T) {
+	t.Parallel()
+
+	dialer := defaultDialer()
+	require.Equal(t, 30*time.Second, dialer.Timeout)
+	require.Equal(t, 30*time.Second, dialer.KeepAlive)
+}
+
+func TestWithDefaultTimeout(t *testing.T) {
+	t.Parallel()
+
+	t.Run("InjectsDeadlineWhenAbsent", func(t *testing.T) {
+		t.Parallel()
+
+		var got time.Time
+		dial := withDefaultTimeout(func(ctx context.Context, _, _ string) (net.Conn, error) {
+			deadline, ok := ctx.Deadline()
+			require.True(t, ok)
+			got = deadline
+			return nil, nil
+		})
+		before := time.Now()
+		_, err := dial(context.Background(), "tcp", "192.0.2.1:80")
+		require.NoError(t, err)
+		require.WithinRange(t, got, before, before.Add(defaultDialTimeout+time.Minute))
+	})
+
+	t.Run("PreservesCallerDeadline", func(t *testing.T) {
+		t.Parallel()
+
+		want := time.Now().Add(time.Hour)
+		ctx, cancel := context.WithDeadline(context.Background(), want)
+		defer cancel()
+		dial := withDefaultTimeout(func(ctx context.Context, _, _ string) (net.Conn, error) {
+			deadline, ok := ctx.Deadline()
+			require.True(t, ok)
+			require.Equal(t, want, deadline)
+			return nil, nil
+		})
+		_, err := dial(ctx, "tcp", "192.0.2.1:80")
+		require.NoError(t, err)
+	})
+}
+
 func TestDialContextNetworkRestriction(t *testing.T) {
 	t.Parallel()
 
