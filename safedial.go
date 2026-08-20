@@ -88,6 +88,12 @@ type Option func(*config)
 // blocking. Allowed prefixes take precedence over every block rule, so scope
 // them as narrowly as possible. Parse operator-supplied values with
 // ParseAllowedPrefix so IPv4-mapped IPv6 forms cannot bypass the policy.
+//
+// NAT64 translation forms (the RFC 6052 well-known prefix and any
+// WithNAT64Prefixes ranges) are decoded before the allowlist is consulted,
+// so allowing a translator's IPv6 range does not skip validation of the
+// IPv4 destinations it embeds. To reach translated destinations, allow the
+// embedded IPv4 range instead.
 func WithAllowedPrefixes(prefixes ...netip.Prefix) Option {
 	return func(cfg *config) {
 		cfg.allowed = append(cfg.allowed, prefixes...)
@@ -100,7 +106,8 @@ func WithAllowedPrefixes(prefixes ...netip.Prefix) Option {
 // IPv4 policy, exactly like the RFC 6052 well-known prefix, which is always
 // handled. Each prefix must be an IPv6 prefix of an RFC 6052 length (32,
 // 40, 48, 56, 64, or 96), as produced by ParseNAT64Prefix; other values
-// panic.
+// panic. When declared prefixes overlap, the first prefix that contains an
+// address (in the order given) decides the embedding layout.
 func WithNAT64Prefixes(prefixes ...netip.Prefix) Option {
 	for _, prefix := range prefixes {
 		if err := validateNAT64Prefix(prefix); err != nil {
@@ -128,8 +135,10 @@ type BlockedError struct {
 	// Host is the host portion of the requested address: a hostname when
 	// the destination was resolved, or the literal IP that was dialed.
 	Host string
-	// Addr is the blocked IP address with any IPv6 zone stripped and
-	// IPv4-mapped form unmapped.
+	// Addr is the IP address the block verdict applied to, with any IPv6
+	// zone stripped and IPv4-mapped form unmapped. For NAT64 translation
+	// forms this is the embedded IPv4 destination that was blocked, not
+	// the outer IPv6 address.
 	Addr netip.Addr
 }
 
@@ -194,32 +203,45 @@ func CheckAddr(addr netip.Addr, opts ...Option) error {
 		return fmt.Errorf("invalid address")
 	}
 	cfg := newConfig(opts)
-	if cfg.isBlockedAddr(addr) {
-		return &BlockedError{Host: addr.String(), Addr: addr.WithZone("").Unmap()}
+	if bad, blocked := cfg.blockedAddr(addr); blocked {
+		return &BlockedError{Host: addr.String(), Addr: bad}
 	}
 	return nil
 }
 
-// IPv4-mapped addresses are unmapped and IPv6 zones are stripped before
-// checking so address forms cannot bypass prefix policy. Allowed prefixes
-// take precedence. An invalid address matches no predicate or prefix, so it
-// is blocked explicitly to fail closed.
 func (c *config) isBlockedAddr(addr netip.Addr) bool {
+	_, blocked := c.blockedAddr(addr)
+	return blocked
+}
+
+// blockedAddr reports whether addr is blocked by policy and returns the
+// address the verdict applies to: the innermost NAT64-embedded IPv4
+// destination when addr is a translation form, otherwise addr itself with
+// any IPv6 zone stripped and IPv4-mapped form unmapped, so address forms
+// cannot bypass prefix policy.
+//
+// NAT64 decoding runs before the allowlist: an allowed prefix covering a
+// translator's IPv6 range must not skip validation of the addresses it
+// embeds, which would open the whole IPv4 space behind the translator.
+// Allowed prefixes therefore match the decoded destination, and they take
+// precedence over every block rule for it. An invalid address matches no
+// predicate or prefix, so it is blocked explicitly to fail closed.
+func (c *config) blockedAddr(addr netip.Addr) (netip.Addr, bool) {
 	if !addr.IsValid() {
-		return true
+		return addr, true
 	}
 	addr = addr.WithZone("").Unmap()
-	for _, prefix := range c.allowed {
-		if prefix.Contains(addr) {
-			return false
-		}
-	}
 	if wellKnownNAT64Prefix.Contains(addr) {
-		return c.isBlockedAddr(embeddedIPv4(addr, 96))
+		return c.blockedAddr(embeddedIPv4(addr, 96))
 	}
 	for _, prefix := range c.nat64 {
 		if prefix.Contains(addr) {
-			return c.isBlockedAddr(embeddedIPv4(addr, prefix.Bits()))
+			return c.blockedAddr(embeddedIPv4(addr, prefix.Bits()))
+		}
+	}
+	for _, prefix := range c.allowed {
+		if prefix.Contains(addr) {
+			return addr, false
 		}
 	}
 	if addr.IsLoopback() ||
@@ -229,14 +251,14 @@ func (c *config) isBlockedAddr(addr netip.Addr) bool {
 		addr.IsMulticast() ||
 		addr.IsUnspecified() ||
 		addr.IsInterfaceLocalMulticast() {
-		return true
+		return addr, true
 	}
 	for _, prefix := range extraBlockedPrefixes {
 		if prefix.Contains(addr) {
-			return true
+			return addr, true
 		}
 	}
-	return false
+	return addr, false
 }
 
 // embeddedIPv4 extracts the IPv4 address from an RFC 6052 translation

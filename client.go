@@ -79,11 +79,13 @@ func (c *config) checkRedirect(req *http.Request, via []*http.Request) error {
 	// Defense in depth: reject redirects to blocked IP literals before
 	// the request is attempted. Hostnames are validated post-resolution
 	// by the guarded dialer.
-	if ip, err := netip.ParseAddr(req.URL.Hostname()); err == nil && c.isBlockedAddr(ip) {
-		return fmt.Errorf("redirect blocked: %w", &BlockedError{
-			Host: req.URL.Hostname(),
-			Addr: ip.WithZone("").Unmap(),
-		})
+	if ip, err := netip.ParseAddr(req.URL.Hostname()); err == nil {
+		if bad, blocked := c.blockedAddr(ip); blocked {
+			return fmt.Errorf("redirect blocked: %w", &BlockedError{
+				Host: req.URL.Hostname(),
+				Addr: bad,
+			})
+		}
 	}
 	if c.redirect == RedirectSameOrigin {
 		return CheckSameOriginRedirect(req, via)

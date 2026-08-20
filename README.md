@@ -39,7 +39,9 @@ its own network position and credentials.
   library's own implementation.
 - **Supports explicit allowlists.** Deployments that legitimately need to
   reach internal destinations opt in per CIDR; allowed prefixes take
-  precedence over every block rule.
+  precedence over every block rule. NAT64 forms are decoded before the
+  allowlist is consulted, so allowing a translator's IPv6 range cannot
+  skip validation of the IPv4 destinations it embeds.
 - **Splits dial deadlines, keeps Happy Eyeballs.** The remaining deadline
   is divided across resolved addresses so one black-holed address cannot
   consume the whole budget, and dual-stack destinations keep net.Dialer's

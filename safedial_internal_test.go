@@ -106,6 +106,34 @@ func TestIsBlockedAddr(t *testing.T) {
 			allowed: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")},
 			blocked: false,
 		},
+		// Allowlisting a translator's IPv6 range must not skip
+		// validation of the embedded IPv4 destination: NAT64 decoding
+		// runs before the allowlist.
+		{
+			name:    "AllowlistedNAT64WrapperStillBlocksPrivate",
+			addr:    "64:ff9b::a00:1",
+			allowed: []netip.Prefix{netip.MustParsePrefix("64:ff9b::/96")},
+			blocked: true,
+		},
+		{
+			name:    "AllowlistedNAT64WrapperStillBlocksMetadata",
+			addr:    "64:ff9b::a9fe:a9fe",
+			allowed: []netip.Prefix{netip.MustParsePrefix("64:ff9b::/96")},
+			blocked: true,
+		},
+		{
+			name:    "AllowlistedNAT64WrapperKeepsPublic",
+			addr:    "64:ff9b::808:808",
+			allowed: []netip.Prefix{netip.MustParsePrefix("64:ff9b::/96")},
+			blocked: false,
+		},
+		{
+			name:    "AllowlistedConfiguredNAT64WrapperStillBlocksPrivate",
+			addr:    "64:ff9b:1:2:3:4:a00:1",
+			nat64:   []netip.Prefix{netip.MustParsePrefix("64:ff9b:1:2:3:4::/96")},
+			allowed: []netip.Prefix{netip.MustParsePrefix("64:ff9b:1:2:3:4::/96")},
+			blocked: true,
+		},
 		{addr: "64:ff9b::1", blocked: true},
 		{addr: "100::1", blocked: true},
 		{addr: "100:0:0:1::1", blocked: true},
@@ -294,6 +322,14 @@ func TestCheckAddr(t *testing.T) {
 	))
 
 	require.ErrorContains(t, CheckAddr(netip.Addr{}), "invalid address")
+
+	// NAT64 translation forms report the decoded embedded destination,
+	// keeping the requested address in Host.
+	err = CheckAddr(netip.MustParseAddr("64:ff9b::a00:1"))
+	require.ErrorAs(t, err, &blockedErr)
+	require.Equal(t, "64:ff9b::a00:1", blockedErr.Host)
+	require.Equal(t, netip.MustParseAddr("10.0.0.1"), blockedErr.Addr)
+	require.ErrorContains(t, err, "10.0.0.1 is in a private or reserved range")
 }
 
 func TestIsBlockedAddrFailsClosedOnInvalid(t *testing.T) {

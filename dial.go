@@ -105,8 +105,8 @@ func (c *config) dial(
 		return nil, fmt.Errorf("split host/port %q: %w", addr, err)
 	}
 	if ip, parseErr := netip.ParseAddr(host); parseErr == nil {
-		if c.isBlockedAddr(ip) {
-			return nil, &BlockedError{Host: host, Addr: ip.WithZone("").Unmap()}
+		if bad, blocked := c.blockedAddr(ip); blocked {
+			return nil, &BlockedError{Host: host, Addr: bad}
 		}
 		return dialer.DialContext(ctx, network, addr)
 	}
@@ -120,8 +120,8 @@ func (c *config) dial(
 	// Reject when ANY resolved address is blocked so a single tainted DNS
 	// answer short-circuits the dial rather than racing it.
 	for _, ip := range ips {
-		if c.isBlockedAddr(ip) {
-			return nil, &BlockedError{Host: host, Addr: ip.WithZone("").Unmap()}
+		if bad, blocked := c.blockedAddr(ip); blocked {
+			return nil, &BlockedError{Host: host, Addr: bad}
 		}
 	}
 	// Dial a validated IP directly. Dialing by hostname would re-resolve,
