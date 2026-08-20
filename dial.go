@@ -27,16 +27,20 @@ func defaultDialer() *net.Dialer {
 	}
 }
 
-// withDefaultTimeout bounds the whole dial operation, including DNS
-// resolution, when the caller supplies no deadline. net.Dialer.Timeout
-// bounds each connect attempt but not resolution.
+// withDefaultTimeout bounds the whole dial operation, resolution and every
+// connect attempt combined, to defaultDialTimeout unless the caller's
+// deadline is sooner. net.Dialer.Timeout alone is not equivalent: it
+// restarts for each validated address dialed, so multiple black-holed
+// addresses would multiply it, unlike http.DefaultTransport's single
+// connect budget.
 func withDefaultTimeout(
 	next func(ctx context.Context, network, addr string) (net.Conn, error),
 ) func(ctx context.Context, network, addr string) (net.Conn, error) {
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
-		if _, ok := ctx.Deadline(); !ok {
+		limit := time.Now().Add(defaultDialTimeout)
+		if deadline, ok := ctx.Deadline(); !ok || deadline.After(limit) {
 			var cancel context.CancelFunc
-			ctx, cancel = context.WithTimeout(ctx, defaultDialTimeout)
+			ctx, cancel = context.WithDeadline(ctx, limit)
 			defer cancel()
 		}
 		return next(ctx, network, addr)
@@ -46,9 +50,9 @@ func withDefaultTimeout(
 // NewDialContext returns a DialContext function that validates every
 // destination against the policy before connecting through base. A nil base
 // uses a dialer with http.DefaultTransport's timeout and keep-alive, and
-// additionally bounds the whole operation, resolution included, by that
-// timeout when the caller's context has no deadline. Only tcp, tcp4, and
-// tcp6 networks are permitted.
+// bounds each whole dial operation, resolution and all connect attempts
+// combined, by that timeout unless the caller's deadline is sooner. Only
+// tcp, tcp4, and tcp6 networks are permitted.
 //
 // Hostnames are resolved first and each resolved address is validated; the
 // connection is then made to a validated IP directly, so a hostile resolver

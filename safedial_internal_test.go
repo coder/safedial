@@ -587,10 +587,10 @@ func TestWithDefaultTimeout(t *testing.T) {
 		require.WithinRange(t, got, before, before.Add(defaultDialTimeout+time.Minute))
 	})
 
-	t.Run("PreservesCallerDeadline", func(t *testing.T) {
+	t.Run("PreservesSoonerCallerDeadline", func(t *testing.T) {
 		t.Parallel()
 
-		want := time.Now().Add(time.Hour)
+		want := time.Now().Add(time.Second)
 		ctx, cancel := context.WithDeadline(context.Background(), want)
 		defer cancel()
 		dial := withDefaultTimeout(func(ctx context.Context, _, _ string) (net.Conn, error) {
@@ -601,6 +601,24 @@ func TestWithDefaultTimeout(t *testing.T) {
 		})
 		_, err := dial(ctx, "tcp", "192.0.2.1:80")
 		require.NoError(t, err)
+	})
+
+	t.Run("CapsLaterCallerDeadline", func(t *testing.T) {
+		t.Parallel()
+
+		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(time.Hour))
+		defer cancel()
+		var got time.Time
+		dial := withDefaultTimeout(func(ctx context.Context, _, _ string) (net.Conn, error) {
+			deadline, ok := ctx.Deadline()
+			require.True(t, ok)
+			got = deadline
+			return nil, nil
+		})
+		before := time.Now()
+		_, err := dial(ctx, "tcp", "192.0.2.1:80")
+		require.NoError(t, err)
+		require.WithinRange(t, got, before, before.Add(defaultDialTimeout+time.Minute))
 	})
 }
 
