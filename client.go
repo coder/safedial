@@ -1,6 +1,7 @@
 package safedial
 
 import (
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net/http"
@@ -91,8 +92,12 @@ func (c *config) checkRedirect(req *http.Request, via []*http.Request) error {
 
 // NewTransport returns a clone of base (or of http.DefaultTransport when
 // base is nil) whose every connection goes through the guarded dialer.
-// Proxies and alternate dial paths are cleared so the guard cannot be
-// bypassed; all other transport settings are preserved.
+// Proxies, alternate dial paths, and TLS protocol upgrades inherited from
+// the base (whose connection pools are shared with the unguarded base and
+// so could serve unvalidated connections) are cleared so the guard cannot
+// be bypassed; all other transport settings are preserved. A base that
+// enabled HTTP/2 through http2.ConfigureTransport keeps HTTP/2 support via
+// the stdlib's own implementation with a private connection pool.
 //
 // When base is nil and http.DefaultTransport has been globally replaced
 // with something other than *http.Transport, it cannot be guarded and
@@ -124,6 +129,25 @@ func (c *config) transport(base *http.Transport) *http.Transport {
 	transport.DialTLS = nil
 	transport.DialTLSContext = nil
 	transport.DialContext = c.dialFunc(nil)
+
+	// TLS protocol upgrades inherited from the base are severed too. An
+	// "h2" entry installed by http2.ConfigureTransport carries the base
+	// transport's HTTP/2 connection pool: its upgrade func discards the
+	// freshly dialed connection when the shared pool already has one for
+	// the authority, so a guarded request could ride a connection the
+	// guard never validated. ForceAttemptHTTP2 re-enables the stdlib's
+	// own HTTP/2 with a pool private to the returned transport. Other
+	// upgrade protocols hand the connection to RoundTrippers whose dial
+	// behavior cannot be guarded, so they are dropped. An explicitly
+	// empty map, the documented way to disable HTTP/2, is preserved.
+	if len(transport.TLSNextProto) > 0 {
+		if _, ok := transport.TLSNextProto["h2"]; ok {
+			transport.TLSNextProto = nil
+			transport.ForceAttemptHTTP2 = true
+		} else {
+			transport.TLSNextProto = make(map[string]func(string, *tls.Conn) http.RoundTripper)
+		}
+	}
 	return transport
 }
 

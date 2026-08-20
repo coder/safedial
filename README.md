@@ -32,8 +32,11 @@ its own network position and credentials.
   is attempted, every hop goes through the guarded dialer, and stricter
   policies (same-origin only, deny all) are available for credentialed
   flows such as OAuth token exchange.
-- **Hardens the transport.** Proxies and alternate dial paths are cleared
-  so the guarded dialer is the only way out.
+- **Hardens the transport.** Proxies, alternate dial paths, and TLS
+  protocol upgrades inherited from the base transport (which share
+  connection pools with the unguarded base) are cleared so the guarded
+  dialer is the only way out; HTTP/2 stays enabled through the standard
+  library's own implementation.
 - **Supports explicit allowlists.** Deployments that legitimately need to
   reach internal destinations opt in per CIDR; allowed prefixes take
   precedence over every block rule.

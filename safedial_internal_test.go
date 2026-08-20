@@ -2,6 +2,7 @@ package safedial
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"net"
 	"net/http"
@@ -706,6 +707,74 @@ func TestNewTransportPreservesSettings(t *testing.T) {
 	require.NotNil(t, transport.DialContext)
 	// The base transport is not mutated.
 	require.NotNil(t, base.Proxy)
+}
+
+func TestNewTransportSeversInheritedTLSNextProto(t *testing.T) {
+	t.Parallel()
+
+	upgrade := func(string, *tls.Conn) http.RoundTripper { return nil }
+
+	t.Run("H2EntryDropsPoolAndKeepsHTTP2", func(t *testing.T) {
+		t.Parallel()
+
+		base := &http.Transport{
+			TLSNextProto: map[string]func(string, *tls.Conn) http.RoundTripper{
+				"h2": upgrade,
+			},
+		}
+		transport := NewTransport(base)
+		require.Nil(t, transport.TLSNextProto)
+		require.True(t, transport.ForceAttemptHTTP2)
+		// The base transport is not mutated.
+		require.Contains(t, base.TLSNextProto, "h2")
+		require.False(t, base.ForceAttemptHTTP2)
+	})
+
+	t.Run("ExoticEntryDroppedWithoutEnablingHTTP2", func(t *testing.T) {
+		t.Parallel()
+
+		base := &http.Transport{
+			TLSNextProto: map[string]func(string, *tls.Conn) http.RoundTripper{
+				"custom-proto": upgrade,
+			},
+		}
+		transport := NewTransport(base)
+		require.NotNil(t, transport.TLSNextProto)
+		require.Empty(t, transport.TLSNextProto)
+		require.False(t, transport.ForceAttemptHTTP2)
+	})
+
+	t.Run("ExplicitlyEmptyMapStaysDisabled", func(t *testing.T) {
+		t.Parallel()
+
+		base := &http.Transport{
+			TLSNextProto:      map[string]func(string, *tls.Conn) http.RoundTripper{},
+			ForceAttemptHTTP2: true,
+		}
+		transport := NewTransport(base)
+		require.NotNil(t, transport.TLSNextProto)
+		require.Empty(t, transport.TLSNextProto)
+	})
+}
+
+func TestGuardedClientSpeaksHTTP2(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	server.EnableHTTP2 = true
+	server.StartTLS()
+	t.Cleanup(server.Close)
+
+	ctx := testContext(t, testWait)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL, nil)
+	require.NoError(t, err)
+	client := NewHTTPClient(server.Client(), WithAllowedPrefixes(allowOnly127001...))
+	resp, err := client.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, 2, resp.ProtoMajor)
 }
 
 func TestHTTPClientSSRF(t *testing.T) {
