@@ -512,6 +512,23 @@ func TestNewHTTPClientRejectsUnguardableTransport(t *testing.T) {
 	)
 }
 
+// Mutates the global http.DefaultTransport, so it must not run in parallel
+// with tests that construct guarded clients from a nil base.
+//
+//nolint:paralleltest
+func TestRejectsUnguardableDefaultTransport(t *testing.T) {
+	orig := http.DefaultTransport
+	http.DefaultTransport = roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("must not be reached")
+	})
+	defer func() { http.DefaultTransport = orig }()
+
+	want := "safedial: http.DefaultTransport safedial.roundTripperFunc cannot be guarded: only *http.Transport is supported"
+	require.PanicsWithValue(t, want, func() { NewTransport(nil) })
+	require.PanicsWithValue(t, want, func() { NewHTTPClient(nil) })
+	require.PanicsWithValue(t, want, func() { NewHTTPClient(&http.Client{}) })
+}
+
 func TestNewTransportPreservesSettings(t *testing.T) {
 	t.Parallel()
 

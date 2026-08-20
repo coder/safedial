@@ -93,6 +93,10 @@ func (c *config) checkRedirect(req *http.Request, via []*http.Request) error {
 // base is nil) whose every connection goes through the guarded dialer.
 // Proxies and alternate dial paths are cleared so the guard cannot be
 // bypassed; all other transport settings are preserved.
+//
+// When base is nil and http.DefaultTransport has been globally replaced
+// with something other than *http.Transport, it cannot be guarded and
+// NewTransport panics rather than silently substituting a blank transport.
 func NewTransport(base *http.Transport, opts ...Option) *http.Transport {
 	return newConfig(opts).transport(base)
 }
@@ -100,15 +104,16 @@ func NewTransport(base *http.Transport, opts ...Option) *http.Transport {
 func (c *config) transport(base *http.Transport) *http.Transport {
 	transport := base
 	if transport == nil {
-		if t, ok := http.DefaultTransport.(*http.Transport); ok {
-			transport = t
+		t, ok := http.DefaultTransport.(*http.Transport)
+		if !ok {
+			panic(fmt.Sprintf(
+				"safedial: http.DefaultTransport %T cannot be guarded: only *http.Transport is supported",
+				http.DefaultTransport,
+			))
 		}
+		transport = t
 	}
-	if transport != nil {
-		transport = transport.Clone()
-	} else {
-		transport = &http.Transport{}
-	}
+	transport = transport.Clone()
 
 	// Force every connection through the guarded dialer: no proxies and
 	// no alternate dial paths that would bypass it.
@@ -132,6 +137,8 @@ func (c *config) transport(base *http.Transport) *http.Transport {
 // transport can be preserved. Any other RoundTripper (tracing wrappers,
 // test doubles) cannot be guarded and NewHTTPClient panics rather than
 // silently replacing it; unwrap to the underlying *http.Transport first.
+// The same applies to a globally replaced http.DefaultTransport when base
+// or its transport is nil.
 func NewHTTPClient(base *http.Client, opts ...Option) *http.Client {
 	cfg := newConfig(opts)
 	timeout := 30 * time.Second
