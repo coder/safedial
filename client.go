@@ -90,6 +90,25 @@ func (c *config) checkRedirect(req *http.Request, via []*http.Request) error {
 	return nil
 }
 
+// redirectFunc composes the base client's CheckRedirect with the guard's
+// redirect policy. The base check runs first so its verdicts keep working
+// when the client is wrapped: returning http.ErrUseLastResponse or an error
+// stops the redirect from being followed, which never weakens the guard.
+// Redirects the base allows are still subject to the guard's checks.
+func (c *config) redirectFunc(
+	base func(req *http.Request, via []*http.Request) error,
+) func(req *http.Request, via []*http.Request) error {
+	if base == nil {
+		return c.checkRedirect
+	}
+	return func(req *http.Request, via []*http.Request) error {
+		if err := base(req, via); err != nil {
+			return err
+		}
+		return c.checkRedirect(req, via)
+	}
+}
+
 // NewTransport returns a clone of base (or of http.DefaultTransport when
 // base is nil) whose every connection goes through the guarded dialer.
 // Proxies, alternate dial paths, and TLS protocol upgrades inherited from
@@ -154,8 +173,11 @@ func (c *config) transport(base *http.Transport) *http.Transport {
 // NewHTTPClient returns an *http.Client that blocks private and special-use
 // destinations unless explicitly allowed. It validates and dials resolved
 // IPs directly to prevent DNS rebinding and applies the configured redirect
-// policy. Base client timeouts, cookie jar, and non-routing transport
-// settings are preserved; a nil base gets a 30 second timeout.
+// policy. Base client timeouts, cookie jar, CheckRedirect, and non-routing
+// transport settings are preserved; a nil base gets a 30 second timeout.
+// A base CheckRedirect runs before the guard's redirect policy: it can
+// still stop a redirect (including with http.ErrUseLastResponse), and
+// redirects it allows remain subject to the guard.
 //
 // The guard must own the dial path, so only a nil or *http.Transport base
 // transport can be preserved. Any other RoundTripper (tracing wrappers,
@@ -168,9 +190,11 @@ func NewHTTPClient(base *http.Client, opts ...Option) *http.Client {
 	timeout := 30 * time.Second
 	var baseTransport *http.Transport
 	var jar http.CookieJar
+	var baseCheckRedirect func(req *http.Request, via []*http.Request) error
 	if base != nil {
 		timeout = base.Timeout
 		jar = base.Jar
+		baseCheckRedirect = base.CheckRedirect
 		switch t := base.Transport.(type) {
 		case nil:
 		case *http.Transport:
@@ -185,7 +209,7 @@ func NewHTTPClient(base *http.Client, opts ...Option) *http.Client {
 	return &http.Client{
 		Timeout:       timeout,
 		Transport:     cfg.transport(baseTransport),
-		CheckRedirect: cfg.checkRedirect,
+		CheckRedirect: cfg.redirectFunc(baseCheckRedirect),
 		Jar:           jar,
 	}
 }

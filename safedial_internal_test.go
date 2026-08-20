@@ -757,6 +757,96 @@ func TestNewTransportSeversInheritedTLSNextProto(t *testing.T) {
 	})
 }
 
+func TestNewHTTPClientPreservesCheckRedirect(t *testing.T) {
+	t.Parallel()
+
+	// A redirecting server and its target, both on the allowlisted
+	// loopback so only redirect handling decides the outcome.
+	newRedirectingServer := func(t *testing.T) (*httptest.Server, *atomic.Int64) {
+		t.Helper()
+		var finalHits atomic.Int64
+		mux := http.NewServeMux()
+		mux.HandleFunc("/start", func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, "/final", http.StatusFound)
+		})
+		mux.HandleFunc("/final", func(w http.ResponseWriter, _ *http.Request) {
+			finalHits.Add(1)
+			w.WriteHeader(http.StatusOK)
+		})
+		server := httptest.NewServer(mux)
+		t.Cleanup(server.Close)
+		return server, &finalHits
+	}
+
+	t.Run("ErrUseLastResponseStopsFollowing", func(t *testing.T) {
+		t.Parallel()
+		ctx := testContext(t, testWait)
+		server, finalHits := newRedirectingServer(t)
+
+		base := &http.Client{
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL+"/start", nil)
+		require.NoError(t, err)
+		resp, err := NewHTTPClient(base, WithAllowedPrefixes(allowOnly127001...)).Do(req)
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		require.Equal(t, http.StatusFound, resp.StatusCode)
+		require.Zero(t, finalHits.Load())
+	})
+
+	t.Run("BaseErrorStopsFollowing", func(t *testing.T) {
+		t.Parallel()
+		ctx := testContext(t, testWait)
+		server, finalHits := newRedirectingServer(t)
+
+		errBase := errors.New("base says no")
+		base := &http.Client{
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return errBase
+			},
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL+"/start", nil)
+		require.NoError(t, err)
+		resp, err := NewHTTPClient(base, WithAllowedPrefixes(allowOnly127001...)).Do(req)
+		if resp != nil {
+			defer resp.Body.Close()
+		}
+		require.ErrorIs(t, err, errBase)
+		require.Zero(t, finalHits.Load())
+	})
+
+	t.Run("GuardStillChecksRedirectsBaseAllows", func(t *testing.T) {
+		t.Parallel()
+		ctx := testContext(t, testWait)
+		canary, hits := startCanaryServer(t)
+		attacker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, canary.URL, http.StatusFound)
+		}))
+		t.Cleanup(attacker.Close)
+
+		var baseChecks atomic.Int64
+		base := &http.Client{
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				baseChecks.Add(1)
+				return nil
+			},
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, attacker.URL, nil)
+		require.NoError(t, err)
+		resp, err := NewHTTPClient(base, WithAllowedPrefixes(allowOnly127001...)).Do(req)
+		if resp != nil {
+			defer resp.Body.Close()
+		}
+		var blockedErr *BlockedError
+		require.ErrorAs(t, err, &blockedErr)
+		require.Equal(t, int64(1), baseChecks.Load())
+		require.Zero(t, hits.Load())
+	})
+}
+
 func TestGuardedClientSpeaksHTTP2(t *testing.T) {
 	t.Parallel()
 
