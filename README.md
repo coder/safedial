@@ -52,9 +52,6 @@ its own network position and credentials.
 ```go
 import "github.com/coder/safedial"
 
-// HTTP client for user-controlled URLs.
-client := safedial.NewHTTPClient(nil)
-
 // Inherit timeouts and transport settings from an existing client, allow a
 // deployment-configured internal range, and keep OAuth redirects on-origin.
 base := &http.Client{Timeout: 15 * time.Second}
@@ -62,21 +59,27 @@ allowed, err := safedial.ParseAllowedPrefix("10.2.0.0/16")
 if err != nil {
     // Reject the configuration.
 }
-client = safedial.NewHTTPClient(base,
+client := safedial.NewHTTPClient(base,
     safedial.WithAllowedPrefixes(allowed),
     safedial.WithRedirectPolicy(safedial.RedirectSameOrigin),
 )
 
-// Raw guarded dialer for non-HTTP protocols or hand-built transports.
-dial := safedial.NewDialContext(nil)
-
-// Map policy rejections to caller-facing validation errors.
 resp, err := client.Get(userProvidedURL)
-var blocked *safedial.BlockedError
-if errors.As(err, &blocked) {
-    // 400, not 502: the destination was rejected, nothing was dialed.
+if err != nil {
+    // Map policy rejections to caller-facing validation errors:
+    // 400, not 502. The destination was rejected, nothing was dialed.
+    var blocked *safedial.BlockedError
+    if errors.As(err, &blocked) {
+        return fmt.Errorf("destination not allowed: %w", err)
+    }
+    return err
 }
+defer resp.Body.Close()
 ```
+
+For non-HTTP protocols or hand-built transports,
+`safedial.NewDialContext(nil)` returns a guarded `DialContext` function that
+applies the same policy and accepts the same options.
 
 ## What it does not do
 
