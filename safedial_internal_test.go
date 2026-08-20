@@ -3,6 +3,7 @@ package safedial
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"net"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1047,21 +1049,92 @@ func TestNewHTTPClientPreservesCheckRedirect(t *testing.T) {
 func TestGuardedClientSpeaksHTTP2(t *testing.T) {
 	t.Parallel()
 
-	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	server.EnableHTTP2 = true
-	server.StartTLS()
-	t.Cleanup(server.Close)
+	newH2Server := func(t *testing.T) *httptest.Server {
+		t.Helper()
+		server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}))
+		server.EnableHTTP2 = true
+		server.StartTLS()
+		t.Cleanup(server.Close)
+		return server
+	}
 
-	ctx := testContext(t, testWait)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL, nil)
-	require.NoError(t, err)
-	client := NewHTTPClient(server.Client(), WithAllowedPrefixes(allowOnly127001...))
-	resp, err := client.Do(req)
-	require.NoError(t, err)
-	defer resp.Body.Close()
-	require.Equal(t, 2, resp.ProtoMajor)
+	t.Run("PreconfiguredH2Base", func(t *testing.T) {
+		t.Parallel()
+
+		server := newH2Server(t)
+		ctx := testContext(t, testWait)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL, nil)
+		require.NoError(t, err)
+		client := NewHTTPClient(server.Client(), WithAllowedPrefixes(allowOnly127001...))
+		resp, err := client.Do(req)
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		require.Equal(t, 2, resp.ProtoMajor)
+	})
+
+	// A plain, never-configured base is the dangerous case: cloning it
+	// fires the base's protocol setup, which leaves the clone's TLS
+	// config advertising "h2" via ALPN while the guarded DialContext
+	// stops the stdlib from wiring HTTP/2 up on the clone by itself.
+	// Without realignment, this request fails with a malformed-response
+	// error instead of negotiating HTTP/2.
+	t.Run("PlainBase", func(t *testing.T) {
+		t.Parallel()
+
+		server := newH2Server(t)
+		transport := NewTransport(&http.Transport{}, WithAllowedPrefixes(allowOnly127001...))
+		require.NotNil(t, transport.TLSClientConfig)
+		pool := x509.NewCertPool()
+		pool.AddCert(server.Certificate())
+		transport.TLSClientConfig.RootCAs = pool
+
+		ctx := testContext(t, testWait)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL, nil)
+		require.NoError(t, err)
+		client := &http.Client{Transport: transport}
+		resp, err := client.Do(req)
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		require.Equal(t, 2, resp.ProtoMajor)
+	})
+}
+
+// A guarded transport must never advertise an ALPN protocol it cannot
+// speak: whenever the TLS config offers "h2", either an upgrade entry or
+// ForceAttemptHTTP2 must be in place.
+func TestNewTransportALPNConsistency(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		base *http.Transport
+	}{
+		{name: "PlainBase", base: &http.Transport{}},
+		{name: "PlainBaseWithSettings", base: &http.Transport{MaxIdleConns: 42}},
+		{
+			name: "H2AdvertisingTLSConfigOnly",
+			base: &http.Transport{
+				TLSClientConfig: &tls.Config{NextProtos: []string{"h2", "http/1.1"}},
+			},
+		},
+		{name: "CustomTLSConfigNoALPN", base: &http.Transport{TLSClientConfig: &tls.Config{}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			transport := NewTransport(tc.base)
+			advertisesH2 := transport.TLSClientConfig != nil &&
+				slices.Contains(transport.TLSClientConfig.NextProtos, "h2")
+			if advertisesH2 {
+				_, hasUpgrade := transport.TLSNextProto["h2"]
+				require.True(t, transport.ForceAttemptHTTP2 || hasUpgrade,
+					"transport advertises h2 via ALPN but cannot speak it")
+			}
+		})
+	}
 }
 
 func TestHTTPClientSSRF(t *testing.T) {

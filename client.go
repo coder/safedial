@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 )
@@ -166,6 +167,20 @@ func (c *config) transport(base *http.Transport) *http.Transport {
 		} else {
 			transport.TLSNextProto = make(map[string]func(string, *tls.Conn) http.RoundTripper)
 		}
+	}
+
+	// Clone() fired the base's protocol setup: a base that had not yet
+	// decided its protocols auto-enables the stdlib's HTTP/2, which
+	// mutates its TLS config to advertise "h2" via ALPN. The clone
+	// inherits that TLS config but not the upgrade map (or the map was
+	// just severed above), and the guarded DialContext makes the stdlib
+	// decline to re-enable HTTP/2 on the clone by itself. Left alone,
+	// the guarded transport would advertise "h2" it cannot speak and
+	// fail outright against HTTP/2 servers, so re-align the two.
+	if transport.TLSNextProto == nil && !transport.ForceAttemptHTTP2 &&
+		transport.TLSClientConfig != nil &&
+		slices.Contains(transport.TLSClientConfig.NextProtos, "h2") {
+		transport.ForceAttemptHTTP2 = true
 	}
 	return transport
 }
