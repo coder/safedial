@@ -126,9 +126,12 @@ func (c *config) redirectFunc(
 // Proxies, alternate dial paths, and TLS protocol upgrades inherited from
 // the base (whose connection pools are shared with the unguarded base and
 // so could serve unvalidated connections) are cleared so the guard cannot
-// be bypassed; all other transport settings are preserved. A base that
-// enabled HTTP/2 through http2.ConfigureTransport keeps HTTP/2 support via
-// the stdlib's own implementation with a private connection pool.
+// be bypassed; all other transport settings are preserved. A base
+// transport's own dial functions, including any custom timeouts, local
+// address bindings, or socket controls they carried, are replaced by the
+// guarded dialer and its defaults. A base that enabled HTTP/2 through
+// http2.ConfigureTransport keeps HTTP/2 support via the stdlib's own
+// implementation with a private connection pool.
 //
 // When base is nil and http.DefaultTransport has been globally replaced
 // with something other than *http.Transport, it cannot be guarded and

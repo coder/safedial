@@ -94,9 +94,27 @@ type Option func(*config)
 // so allowing a translator's IPv6 range does not skip validation of the
 // IPv4 destinations it embeds. To reach translated destinations, allow the
 // embedded IPv4 range instead.
+//
+// IPv4-mapped IPv6 prefixes are converted to their IPv4 equivalents, same
+// as ParseAllowedPrefix, because addresses are unmapped before matching; a
+// mapped prefix shorter than 96 bits cannot be represented as an IPv4
+// range and panics.
 func WithAllowedPrefixes(prefixes ...netip.Prefix) Option {
+	normalized := make([]netip.Prefix, len(prefixes))
+	for i, prefix := range prefixes {
+		if prefix.Addr().Is4In6() {
+			if prefix.Bits() < 96 {
+				panic(fmt.Sprintf(
+					"safedial: allowed prefix %q: IPv4-mapped IPv6 prefix length must be at least 96 bits",
+					prefix,
+				))
+			}
+			prefix = netip.PrefixFrom(prefix.Addr().Unmap(), prefix.Bits()-96)
+		}
+		normalized[i] = prefix
+	}
 	return func(cfg *config) {
-		cfg.allowed = append(cfg.allowed, prefixes...)
+		cfg.allowed = append(cfg.allowed, normalized...)
 	}
 }
 

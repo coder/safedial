@@ -425,6 +425,24 @@ func TestParseNAT64Prefix(t *testing.T) {
 	})
 }
 
+// A raw IPv4-mapped prefix handed directly to WithAllowedPrefixes (skipping
+// ParseAllowedPrefix) must match the unmapped addresses checked against it
+// rather than silently never matching.
+func TestWithAllowedPrefixesNormalizesMapped(t *testing.T) {
+	t.Parallel()
+
+	cfg := newConfig([]Option{
+		WithAllowedPrefixes(netip.MustParsePrefix("::ffff:10.0.0.0/104")),
+	})
+	require.False(t, cfg.isBlockedAddr(netip.MustParseAddr("10.1.2.3")))
+	require.False(t, cfg.isBlockedAddr(netip.MustParseAddr("::ffff:10.1.2.3")))
+	require.True(t, cfg.isBlockedAddr(netip.MustParseAddr("192.168.0.1")))
+
+	require.Panics(t, func() {
+		WithAllowedPrefixes(netip.MustParsePrefix("::ffff:0.0.0.0/95"))
+	})
+}
+
 func startCanaryServer(t *testing.T) (*httptest.Server, *atomic.Int64) {
 	t.Helper()
 
