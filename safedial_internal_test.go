@@ -11,6 +11,7 @@ import (
 	"net/netip"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -32,6 +33,22 @@ type dialContextFunc func(context.Context, string, string) (net.Conn, error)
 
 func (f dialContextFunc) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
 	return f(ctx, network, addr)
+}
+
+// closeNotifyConn signals on closed the first time Close is called.
+type closeNotifyConn struct {
+	net.Conn
+	once   sync.Once
+	closed chan struct{}
+}
+
+func newCloseNotifyConn(inner net.Conn) *closeNotifyConn {
+	return &closeNotifyConn{Conn: inner, closed: make(chan struct{})}
+}
+
+func (c *closeNotifyConn) Close() error {
+	c.once.Do(func() { close(c.closed) })
+	return c.Conn.Close()
 }
 
 func TestIsBlockedAddr(t *testing.T) {
@@ -514,6 +531,186 @@ func TestDialValidatedIPs(t *testing.T) {
 			t.Fatal("timed out waiting for the successful connection")
 		}
 	})
+
+	v6 := netip.MustParseAddr("2001:db8::1")
+	v4 := netip.MustParseAddr("192.0.2.1")
+	isV6 := func(addr string) bool { return strings.HasPrefix(addr, "[") }
+
+	t.Run("FallbackFamilyWinsWhilePrimaryStalls", func(t *testing.T) {
+		t.Parallel()
+
+		client, server := net.Pipe()
+		t.Cleanup(func() {
+			_ = client.Close()
+			_ = server.Close()
+		})
+		dialer := dialContextFunc(func(ctx context.Context, _, addr string) (net.Conn, error) {
+			if isV6(addr) {
+				<-ctx.Done()
+				return nil, ctx.Err()
+			}
+			return client, nil
+		})
+
+		ctx := testContext(t, testWait)
+		start := time.Now()
+		conn, err := dialValidatedIPs(ctx, dialer, "tcp", "80", []netip.Addr{v6, v4})
+		elapsed := time.Since(start)
+		require.NoError(t, err)
+		require.Same(t, client, conn)
+		// Serial dialing would burn the stalled primary's share of the
+		// deadline (half of testWait) before trying the other family;
+		// the fallback race must connect much sooner.
+		require.Less(t, elapsed, testWait/2-time.Second)
+	})
+
+	t.Run("PrimaryFailureStartsFallbackImmediately", func(t *testing.T) {
+		t.Parallel()
+
+		client, server := net.Pipe()
+		t.Cleanup(func() {
+			_ = client.Close()
+			_ = server.Close()
+		})
+		dialer := dialContextFunc(func(_ context.Context, _, addr string) (net.Conn, error) {
+			if isV6(addr) {
+				return nil, errors.New("v6 refused")
+			}
+			return client, nil
+		})
+
+		ctx := testContext(t, testWait)
+		start := time.Now()
+		conn, err := dialValidatedIPs(ctx, dialer, "tcp", "80", []netip.Addr{v6, v4})
+		elapsed := time.Since(start)
+		require.NoError(t, err)
+		require.Same(t, client, conn)
+		// The fallback must start as soon as every primary attempt has
+		// failed rather than waiting out the fallback delay.
+		require.Less(t, elapsed, defaultFallbackDelay)
+	})
+
+	t.Run("PrimaryErrorReportedWhenBothFail", func(t *testing.T) {
+		t.Parallel()
+
+		errV6 := errors.New("v6 refused")
+		errV4 := errors.New("v4 refused")
+		dialer := dialContextFunc(func(_ context.Context, _, addr string) (net.Conn, error) {
+			if isV6(addr) {
+				return nil, errV6
+			}
+			return nil, errV4
+		})
+
+		ctx := testContext(t, testWait)
+		conn, err := dialValidatedIPs(ctx, dialer, "tcp", "80", []netip.Addr{v6, v4})
+		require.Nil(t, conn)
+		require.ErrorIs(t, err, errV6)
+	})
+
+	t.Run("LosingDialIsClosed", func(t *testing.T) {
+		t.Parallel()
+
+		winner, winnerPeer := net.Pipe()
+		loserInner, loserPeer := net.Pipe()
+		t.Cleanup(func() {
+			_ = winner.Close()
+			_ = winnerPeer.Close()
+			_ = loserInner.Close()
+			_ = loserPeer.Close()
+		})
+		loser := newCloseNotifyConn(loserInner)
+		dialer := dialContextFunc(func(_ context.Context, _, addr string) (net.Conn, error) {
+			if isV6(addr) {
+				// Ignore cancellation deliberately and complete long
+				// after the fallback has won, exercising the
+				// loser-cleanup path.
+				time.Sleep(2 * time.Second)
+				return loser, nil
+			}
+			return winner, nil
+		})
+
+		ctx := testContext(t, testWait)
+		conn, err := dialValidatedIPs(ctx, dialer, "tcp", "80", []netip.Addr{v6, v4})
+		require.NoError(t, err)
+		require.Same(t, winner, conn)
+		select {
+		case <-loser.closed:
+		case <-ctx.Done():
+			t.Fatal("losing dial's connection was not closed")
+		}
+	})
+
+	t.Run("NegativeFallbackDelayDialsSequentially", func(t *testing.T) {
+		t.Parallel()
+
+		var mu sync.Mutex
+		inFlight, maxInFlight := 0, 0
+		dialer := &net.Dialer{
+			FallbackDelay: -1,
+			ControlContext: func(ctx context.Context, _, _ string, _ syscall.RawConn) error {
+				mu.Lock()
+				inFlight++
+				if inFlight > maxInFlight {
+					maxInFlight = inFlight
+				}
+				mu.Unlock()
+				<-ctx.Done()
+				mu.Lock()
+				inFlight--
+				mu.Unlock()
+				return ctx.Err()
+			},
+		}
+
+		// Both attempts stall until their share of the deadline ends. A
+		// (wrongly) racing fallback would overlap the stalled primary.
+		ctx := testContext(t, 1500*time.Millisecond)
+		conn, err := dialValidatedIPs(ctx, dialer, "tcp", "9", []netip.Addr{
+			netip.MustParseAddr("::1"),
+			netip.MustParseAddr("127.0.0.1"),
+		})
+		require.Nil(t, conn)
+		require.Error(t, err)
+		mu.Lock()
+		defer mu.Unlock()
+		require.Equal(t, 1, maxInFlight)
+	})
+}
+
+func TestFallbackDelayResolution(t *testing.T) {
+	t.Parallel()
+
+	require.Equal(t, defaultFallbackDelay, fallbackDelay(dialContextFunc(nil)))
+	require.Equal(t, defaultFallbackDelay, fallbackDelay(&net.Dialer{}))
+	require.Equal(t, 150*time.Millisecond, fallbackDelay(&net.Dialer{FallbackDelay: 150 * time.Millisecond}))
+	require.Equal(t, time.Duration(-1), fallbackDelay(&net.Dialer{FallbackDelay: -5 * time.Millisecond}))
+}
+
+func TestPartitionByFamily(t *testing.T) {
+	t.Parallel()
+
+	addr := netip.MustParseAddr
+	primaries, fallbacks := partitionByFamily([]netip.Addr{
+		addr("2001:db8::1"), addr("8.8.8.8"), addr("2001:db8::2"), addr("::ffff:8.8.4.4"),
+	})
+	require.Equal(t, []netip.Addr{addr("2001:db8::1"), addr("2001:db8::2")}, primaries)
+	// Mapped IPv4 counts as IPv4, and order is preserved.
+	require.Equal(t, []netip.Addr{addr("8.8.8.8"), addr("::ffff:8.8.4.4")}, fallbacks)
+
+	// The resolver's first answer picks the primary family.
+	primaries, fallbacks = partitionByFamily([]netip.Addr{addr("::ffff:8.8.4.4"), addr("2001:db8::1")})
+	require.Equal(t, []netip.Addr{addr("::ffff:8.8.4.4")}, primaries)
+	require.Equal(t, []netip.Addr{addr("2001:db8::1")}, fallbacks)
+
+	primaries, fallbacks = partitionByFamily([]netip.Addr{addr("8.8.8.8"), addr("8.8.4.4")})
+	require.Equal(t, []netip.Addr{addr("8.8.8.8"), addr("8.8.4.4")}, primaries)
+	require.Empty(t, fallbacks)
+
+	primaries, fallbacks = partitionByFamily(nil)
+	require.Empty(t, primaries)
+	require.Empty(t, fallbacks)
 }
 
 func TestDialContextIPv6Zone(t *testing.T) {

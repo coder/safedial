@@ -40,9 +40,10 @@ its own network position and credentials.
 - **Supports explicit allowlists.** Deployments that legitimately need to
   reach internal destinations opt in per CIDR; allowed prefixes take
   precedence over every block rule.
-- **Splits dial deadlines.** The remaining deadline is divided across
-  resolved addresses so one black-holed address cannot consume the whole
-  budget.
+- **Splits dial deadlines, keeps Happy Eyeballs.** The remaining deadline
+  is divided across resolved addresses so one black-holed address cannot
+  consume the whole budget, and dual-stack destinations keep net.Dialer's
+  address-family fallback race so a broken family does not stall the dial.
 
 ## Usage
 

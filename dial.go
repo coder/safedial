@@ -59,6 +59,13 @@ func withDefaultTimeout(
 // cannot rebind the name between validation and dialing. IP literals keep
 // their IPv6 zone when dialed.
 //
+// When a hostname resolves to both address families, the validated
+// addresses are dialed with net.Dialer's Happy Eyeballs behavior: the
+// second family starts after a short fallback delay, so base may see
+// concurrent DialContext calls for one dial. A base *net.Dialer's
+// FallbackDelay is honored, including a negative value to disable the
+// race.
+//
 // Use this for non-HTTP protocols or hand-built transports. For HTTP,
 // prefer NewHTTPClient or NewTransport.
 func NewDialContext(base ContextDialer, opts ...Option) func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -124,7 +131,135 @@ func (c *config) dial(
 	return dialValidatedIPs(ctx, dialer, network, port, ips)
 }
 
+// defaultFallbackDelay mirrors net.Dialer's default delay before the
+// fallback address family is dialed (Happy Eyeballs, RFC 8305).
+const defaultFallbackDelay = 300 * time.Millisecond
+
+// dialValidatedIPs connects to validated addresses, preserving the Happy
+// Eyeballs behavior net.Dialer applies when dialing a hostname: the
+// resolver's preferred address family gets a head start and the other
+// family is raced after a short fallback delay, immediately once every
+// primary attempt has failed. Without the race, one black-holed family
+// would consume its whole share of the deadline before the working family
+// is tried. This mirrors net.Dialer.dialParallel; a losing dial that
+// completes anyway is closed.
 func dialValidatedIPs(
+	ctx context.Context,
+	dialer ContextDialer,
+	network string,
+	port string,
+	ips []netip.Addr,
+) (net.Conn, error) {
+	delay := fallbackDelay(dialer)
+	var primaries, fallbacks []netip.Addr
+	if delay < 0 {
+		// Happy Eyeballs disabled: dial everything in sequence.
+		primaries = ips
+	} else {
+		primaries, fallbacks = partitionByFamily(ips)
+	}
+	if len(fallbacks) == 0 {
+		return dialSerial(ctx, dialer, network, port, primaries)
+	}
+
+	type dialResult struct {
+		conn    net.Conn
+		err     error
+		primary bool
+	}
+	// Unbuffered: a losing racer blocks until the loop receives its
+	// result or the function has returned, and then closes its conn.
+	results := make(chan dialResult)
+	returned := make(chan struct{})
+	defer close(returned)
+
+	racer := func(ctx context.Context, primary bool) {
+		addrs := primaries
+		if !primary {
+			addrs = fallbacks
+		}
+		conn, err := dialSerial(ctx, dialer, network, port, addrs)
+		select {
+		case results <- dialResult{conn: conn, err: err, primary: primary}:
+		case <-returned:
+			if conn != nil {
+				_ = conn.Close()
+			}
+		}
+	}
+
+	primaryCtx, primaryCancel := context.WithCancel(ctx)
+	defer primaryCancel()
+	go racer(primaryCtx, true)
+
+	fallbackTimer := time.NewTimer(delay)
+	defer fallbackTimer.Stop()
+
+	var primaryErr, fallbackErr error
+	for {
+		select {
+		case <-fallbackTimer.C:
+			fallbackCtx, fallbackCancel := context.WithCancel(ctx)
+			defer fallbackCancel()
+			go racer(fallbackCtx, false)
+		case res := <-results:
+			if res.err == nil {
+				return res.conn, nil
+			}
+			if res.primary {
+				primaryErr = res.err
+			} else {
+				fallbackErr = res.err
+			}
+			if primaryErr != nil && fallbackErr != nil {
+				// The primary family's error is the most relevant,
+				// matching net.Dialer.
+				return nil, primaryErr
+			}
+			if res.primary && fallbackTimer.Stop() {
+				// Every primary attempt failed before the fallback
+				// started; start it immediately.
+				fallbackTimer.Reset(0)
+			}
+		}
+	}
+}
+
+// fallbackDelay resolves the Happy Eyeballs fallback delay for a dialer
+// with net.Dialer's semantics: a positive FallbackDelay is used as-is, a
+// negative one disables the race (reported as -1), and zero or any other
+// dialer type gets the standard default.
+func fallbackDelay(dialer ContextDialer) time.Duration {
+	if d, ok := dialer.(*net.Dialer); ok {
+		if d.FallbackDelay > 0 {
+			return d.FallbackDelay
+		}
+		if d.FallbackDelay < 0 {
+			return -1
+		}
+	}
+	return defaultFallbackDelay
+}
+
+// partitionByFamily splits addresses into those sharing the first
+// address's family (primaries) and the rest (fallbacks), preserving order
+// within each list, mirroring net.Dialer's Happy Eyeballs partition.
+func partitionByFamily(ips []netip.Addr) (primaries, fallbacks []netip.Addr) {
+	if len(ips) == 0 {
+		return nil, nil
+	}
+	primaryIs4 := ips[0].Unmap().Is4()
+	for _, ip := range ips {
+		if ip.Unmap().Is4() == primaryIs4 {
+			primaries = append(primaries, ip)
+		} else {
+			fallbacks = append(fallbacks, ip)
+		}
+	}
+	return primaries, fallbacks
+}
+
+func dialSerial(
 	ctx context.Context,
 	dialer ContextDialer,
 	network string,
@@ -156,6 +291,9 @@ func dialValidatedIPs(
 		if firstErr == nil {
 			firstErr = dialErr
 		}
+	}
+	if firstErr == nil {
+		firstErr = fmt.Errorf("no addresses to dial")
 	}
 	return nil, firstErr
 }
