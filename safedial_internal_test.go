@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"net/http/cookiejar"
 	"net/http/httptest"
 	"net/netip"
 	"net/url"
@@ -480,6 +481,35 @@ func TestNewHTTPClientTimeout(t *testing.T) {
 	require.Zero(t, NewHTTPClient(&http.Client{}).Timeout)
 	require.Equal(t, 30*time.Second, NewHTTPClient(nil).Timeout)
 	require.Equal(t, 5*time.Second, NewHTTPClient(&http.Client{Timeout: 5 * time.Second}).Timeout)
+}
+
+func TestNewHTTPClientPreservesJar(t *testing.T) {
+	t.Parallel()
+
+	require.Nil(t, NewHTTPClient(nil).Jar)
+	jar, err := cookiejar.New(nil)
+	require.NoError(t, err)
+	require.Same(t, jar, NewHTTPClient(&http.Client{Jar: jar}).Jar)
+}
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func TestNewHTTPClientRejectsUnguardableTransport(t *testing.T) {
+	t.Parallel()
+
+	base := &http.Client{
+		Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+			return nil, errors.New("must not be reached")
+		}),
+	}
+	require.PanicsWithValue(t,
+		"safedial: base transport safedial.roundTripperFunc cannot be guarded: only nil or *http.Transport is supported",
+		func() { NewHTTPClient(base) },
+	)
 }
 
 func TestNewTransportPreservesSettings(t *testing.T) {

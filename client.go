@@ -125,21 +125,36 @@ func (c *config) transport(base *http.Transport) *http.Transport {
 // NewHTTPClient returns an *http.Client that blocks private and special-use
 // destinations unless explicitly allowed. It validates and dials resolved
 // IPs directly to prevent DNS rebinding and applies the configured redirect
-// policy. Base client timeouts and non-routing transport settings are
-// preserved; a nil base gets a 30 second timeout.
+// policy. Base client timeouts, cookie jar, and non-routing transport
+// settings are preserved; a nil base gets a 30 second timeout.
+//
+// The guard must own the dial path, so only a nil or *http.Transport base
+// transport can be preserved. Any other RoundTripper (tracing wrappers,
+// test doubles) cannot be guarded and NewHTTPClient panics rather than
+// silently replacing it; unwrap to the underlying *http.Transport first.
 func NewHTTPClient(base *http.Client, opts ...Option) *http.Client {
 	cfg := newConfig(opts)
 	timeout := 30 * time.Second
 	var baseTransport *http.Transport
+	var jar http.CookieJar
 	if base != nil {
 		timeout = base.Timeout
-		if t, ok := base.Transport.(*http.Transport); ok && t != nil {
+		jar = base.Jar
+		switch t := base.Transport.(type) {
+		case nil:
+		case *http.Transport:
 			baseTransport = t
+		default:
+			panic(fmt.Sprintf(
+				"safedial: base transport %T cannot be guarded: only nil or *http.Transport is supported",
+				base.Transport,
+			))
 		}
 	}
 	return &http.Client{
 		Timeout:       timeout,
 		Transport:     cfg.transport(baseTransport),
 		CheckRedirect: cfg.checkRedirect,
+		Jar:           jar,
 	}
 }
