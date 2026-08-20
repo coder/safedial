@@ -80,7 +80,7 @@ func (c *config) checkRedirect(req *http.Request, via []*http.Request) error {
 	// by the guarded dialer.
 	if ip, err := netip.ParseAddr(req.URL.Hostname()); err == nil && c.isBlockedAddr(ip) {
 		return fmt.Errorf("redirect blocked: %w", &BlockedError{
-			Host: req.URL.Host,
+			Host: req.URL.Hostname(),
 			Addr: ip.WithZone("").Unmap(),
 		})
 	}

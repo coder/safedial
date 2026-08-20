@@ -114,7 +114,7 @@ func (c *config) dial(
 	// answer short-circuits the dial rather than racing it.
 	for _, ip := range ips {
 		if c.isBlockedAddr(ip) {
-			return nil, &BlockedError{Host: host, Addr: ip.Unmap()}
+			return nil, &BlockedError{Host: host, Addr: ip.WithZone("").Unmap()}
 		}
 	}
 	// Dial a validated IP directly. Dialing by hostname would re-resolve,

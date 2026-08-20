@@ -972,6 +972,11 @@ func TestHTTPClientSSRF(t *testing.T) {
 			defer resp.Body.Close()
 		}
 		require.Error(t, err)
+		var blockedErr *BlockedError
+		require.ErrorAs(t, err, &blockedErr)
+		// Host is the host portion only, without the port.
+		require.Equal(t, "127.0.0.2", blockedErr.Host)
+		require.Equal(t, netip.MustParseAddr("127.0.0.2"), blockedErr.Addr)
 		require.Zero(t, hits.Load())
 	})
 
