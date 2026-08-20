@@ -51,8 +51,10 @@ func withDefaultTimeout(
 // destination against the policy before connecting through base. A nil base
 // uses a dialer with http.DefaultTransport's timeout and keep-alive, and
 // bounds each whole dial operation, resolution and all connect attempts
-// combined, by that timeout unless the caller's deadline is sooner. Only
-// tcp, tcp4, and tcp6 networks are permitted.
+// combined, by that timeout unless the caller's deadline is sooner. A
+// non-nil base keeps its own timeout configuration and is bounded only by
+// the caller's context, so pass a context with a deadline or configure the
+// base's timeouts. Only tcp, tcp4, and tcp6 networks are permitted.
 //
 // Hostnames are resolved first and each resolved address is validated; the
 // connection is then made to a validated IP directly, so a hostile resolver
@@ -64,7 +66,8 @@ func withDefaultTimeout(
 // second family starts after a short fallback delay, so base may see
 // concurrent DialContext calls for one dial. A base *net.Dialer's
 // FallbackDelay is honored, including a negative value to disable the
-// race.
+// race; any other ContextDialer implementation, including wrappers around
+// a *net.Dialer, gets the standard 300ms delay.
 //
 // Use this for non-HTTP protocols or hand-built transports. For HTTP,
 // prefer NewHTTPClient or NewTransport.
@@ -268,16 +271,28 @@ func dialSerial(
 ) (net.Conn, error) {
 	var firstErr error
 	for i, ip := range ips {
+		// Fail fast once the context is done instead of issuing
+		// doomed dials for the remaining addresses.
+		if err := ctx.Err(); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			break
+		}
 		dialCtx := ctx
 		cancel := func() {}
 		if deadline, ok := ctx.Deadline(); ok {
 			// Divide the remaining deadline across the remaining
 			// addresses so one black-holed address cannot consume
 			// the whole budget.
-			dialCtx, cancel = context.WithDeadline(
-				ctx,
-				dialAttemptDeadline(time.Now(), deadline, len(ips)-i),
-			)
+			attemptDeadline, err := dialAttemptDeadline(time.Now(), deadline, len(ips)-i)
+			if err != nil {
+				if firstErr == nil {
+					firstErr = err
+				}
+				break
+			}
+			dialCtx, cancel = context.WithDeadline(ctx, attemptDeadline)
 		}
 		conn, dialErr := dialer.DialContext(
 			dialCtx,
@@ -298,6 +313,25 @@ func dialSerial(
 	return nil, firstErr
 }
 
-func dialAttemptDeadline(now, deadline time.Time, attemptsRemaining int) time.Time {
-	return now.Add(deadline.Sub(now) / time.Duration(attemptsRemaining))
+// dialAttemptDeadline mirrors net.Dialer's partialDeadline: the remaining
+// time is divided evenly across the remaining addresses, but every attempt
+// is guaranteed at least two seconds (stolen from later addresses) so a
+// tight deadline over many addresses does not degenerate into windows too
+// short for a TCP handshake. It reports an error when the deadline has
+// already passed.
+func dialAttemptDeadline(now, deadline time.Time, attemptsRemaining int) (time.Time, error) {
+	timeRemaining := deadline.Sub(now)
+	if timeRemaining <= 0 {
+		return time.Time{}, context.DeadlineExceeded
+	}
+	timeout := timeRemaining / time.Duration(attemptsRemaining)
+	const saneMinimum = 2 * time.Second
+	if timeout < saneMinimum {
+		if timeRemaining < saneMinimum {
+			timeout = timeRemaining
+		} else {
+			timeout = saneMinimum
+		}
+	}
+	return now.Add(timeout), nil
 }

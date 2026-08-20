@@ -491,6 +491,11 @@ func TestCheckSameOriginRedirect(t *testing.T) {
 			require.ErrorContains(t, err, tc.wantErr)
 		})
 	}
+
+	t.Run("EmptyViaDoesNotPanic", func(t *testing.T) {
+		t.Parallel()
+		require.NoError(t, CheckSameOriginRedirect(req(http.MethodGet, origin), nil))
+	})
 }
 
 func TestDialAttemptDeadline(t *testing.T) {
@@ -502,17 +507,31 @@ func TestDialAttemptDeadline(t *testing.T) {
 		timeRemaining     time.Duration
 		attemptsRemaining int
 		want              time.Duration
+		wantErr           bool
 	}{
 		{name: "FirstOfTwo", timeRemaining: 6 * time.Second, attemptsRemaining: 2, want: 3 * time.Second},
 		{name: "FirstOfThree", timeRemaining: 6 * time.Second, attemptsRemaining: 3, want: 2 * time.Second},
 		{name: "LastAttempt", timeRemaining: 6 * time.Second, attemptsRemaining: 1, want: 6 * time.Second},
+		// The two second floor steals time from later addresses so a
+		// tight deadline over many addresses does not produce windows
+		// too short for a TCP handshake.
+		{name: "FloorAppliesUnderManyAddresses", timeRemaining: 10 * time.Second, attemptsRemaining: 8, want: 2 * time.Second},
+		{name: "FloorCappedByRemainingTime", timeRemaining: time.Second, attemptsRemaining: 2, want: time.Second},
+		{name: "ExpiredDeadline", timeRemaining: 0, attemptsRemaining: 2, wantErr: true},
+		{name: "PastDeadline", timeRemaining: -time.Second, attemptsRemaining: 1, wantErr: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
 			deadline := now.Add(tc.timeRemaining)
-			require.Equal(t, now.Add(tc.want), dialAttemptDeadline(now, deadline, tc.attemptsRemaining))
+			got, err := dialAttemptDeadline(now, deadline, tc.attemptsRemaining)
+			if tc.wantErr {
+				require.ErrorIs(t, err, context.DeadlineExceeded)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, now.Add(tc.want), got)
 		})
 	}
 }
@@ -552,7 +571,10 @@ func TestDialValidatedIPs(t *testing.T) {
 				return ctx.Err()
 			},
 		}
-		ctx := testContext(t, 2*time.Second)
+		// Six seconds splits into three per address (above the two
+		// second floor), so the stalled first address cannot consume
+		// the whole budget.
+		ctx := testContext(t, 6*time.Second)
 		conn, err := dialValidatedIPs(ctx, dialer, "tcp4", port, []netip.Addr{
 			stalledIP,
 			netip.MustParseAddr("127.0.0.1"),

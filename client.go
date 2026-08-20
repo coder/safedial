@@ -34,7 +34,16 @@ const (
 // CheckSameOriginRedirect allows only method-preserving redirects within the
 // original scheme, host, and port. It can be used directly as an
 // http.Client CheckRedirect.
+//
+// It restricts redirect targets only; it performs no destination address
+// validation of its own. For SSRF protection the client's transport must
+// still dial through the guard, as clients built by NewHTTPClient do.
 func CheckSameOriginRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) == 0 {
+		// http.Client never calls CheckRedirect without at least the
+		// original request; nothing to compare against otherwise.
+		return nil
+	}
 	if len(via) >= 10 {
 		return errors.New("stopped after 10 redirects")
 	}
