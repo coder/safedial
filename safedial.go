@@ -98,8 +98,9 @@ func WithAllowedPrefixes(prefixes ...netip.Prefix) Option {
 // (RFC 8215 network-specific prefixes). Addresses inside a declared prefix
 // have their embedded IPv4 destination extracted and validated with the full
 // IPv4 policy, exactly like the RFC 6052 well-known prefix, which is always
-// handled. Each prefix must be an IPv6 /96 produced by ParseNAT64Prefix;
-// other values panic.
+// handled. Each prefix must be an IPv6 prefix of an RFC 6052 length (32,
+// 40, 48, 56, 64, or 96), as produced by ParseNAT64Prefix; other values
+// panic.
 func WithNAT64Prefixes(prefixes ...netip.Prefix) Option {
 	for _, prefix := range prefixes {
 		if err := validateNAT64Prefix(prefix); err != nil {
@@ -156,10 +157,9 @@ func ParseAllowedPrefix(raw string) (netip.Prefix, error) {
 	return netip.PrefixFrom(prefix.Addr().Unmap(), prefix.Bits()-96), nil
 }
 
-// ParseNAT64Prefix parses a NAT64 translation prefix for WithNAT64Prefixes.
-// Only IPv6 /96 prefixes are supported: RFC 6052 defines shorter layouts,
-// but every modern NAT64 deployment embeds the IPv4 address in the final 32
-// bits.
+// ParseNAT64Prefix parses an RFC 6052 NAT64 translation prefix for
+// WithNAT64Prefixes. Every embedding layout defined by RFC 6052 is
+// supported: IPv6 prefixes of length 32, 40, 48, 56, 64, or 96.
 func ParseNAT64Prefix(raw string) (netip.Prefix, error) {
 	prefix, err := netip.ParsePrefix(raw)
 	if err != nil {
@@ -172,10 +172,15 @@ func ParseNAT64Prefix(raw string) (netip.Prefix, error) {
 }
 
 func validateNAT64Prefix(prefix netip.Prefix) error {
-	if !prefix.Addr().Is6() || prefix.Addr().Is4In6() || prefix.Bits() != 96 {
-		return fmt.Errorf("NAT64 prefix %q must be an IPv6 /96", prefix)
+	if !prefix.Addr().Is6() || prefix.Addr().Is4In6() {
+		return fmt.Errorf("NAT64 prefix %q must be IPv6", prefix)
 	}
-	return nil
+	switch prefix.Bits() {
+	case 32, 40, 48, 56, 64, 96:
+		return nil
+	default:
+		return fmt.Errorf("NAT64 prefix %q must have an RFC 6052 length (32, 40, 48, 56, 64, or 96)", prefix)
+	}
 }
 
 // CheckAddr validates a single IP address against the destination policy.
@@ -202,11 +207,11 @@ func (c *config) isBlockedAddr(addr netip.Addr) bool {
 		}
 	}
 	if wellKnownNAT64Prefix.Contains(addr) {
-		return c.isBlockedAddr(embeddedIPv4(addr))
+		return c.isBlockedAddr(embeddedIPv4(addr, 96))
 	}
 	for _, prefix := range c.nat64 {
 		if prefix.Contains(addr) {
-			return c.isBlockedAddr(embeddedIPv4(addr))
+			return c.isBlockedAddr(embeddedIPv4(addr, prefix.Bits()))
 		}
 	}
 	if addr.IsLoopback() ||
@@ -226,9 +231,28 @@ func (c *config) isBlockedAddr(addr netip.Addr) bool {
 	return false
 }
 
-// embeddedIPv4 extracts the IPv4 address from the final 32 bits of a /96
-// NAT64 translation address.
-func embeddedIPv4(addr netip.Addr) netip.Addr {
-	bytes := addr.As16()
-	return netip.AddrFrom4([4]byte(bytes[12:]))
+// embeddedIPv4 extracts the IPv4 address from an RFC 6052 translation
+// address using the section 2.2 layout for the given prefix length. The u
+// octet (bits 64 to 71) is skipped where the IPv4 bits straddle it.
+func embeddedIPv4(addr netip.Addr, prefixBits int) netip.Addr {
+	b := addr.As16()
+	var v4 [4]byte
+	switch prefixBits {
+	case 32:
+		copy(v4[:], b[4:8])
+	case 40:
+		copy(v4[:3], b[5:8])
+		v4[3] = b[9]
+	case 48:
+		copy(v4[:2], b[6:8])
+		copy(v4[2:], b[9:11])
+	case 56:
+		v4[0] = b[7]
+		copy(v4[1:], b[9:12])
+	case 64:
+		copy(v4[:], b[9:13])
+	default:
+		copy(v4[:], b[12:16])
+	}
+	return netip.AddrFrom4(v4)
 }

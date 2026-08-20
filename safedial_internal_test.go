@@ -114,6 +114,84 @@ func TestIsBlockedAddr(t *testing.T) {
 			nat64:   []netip.Prefix{netip.MustParsePrefix("64:ff9b:1:2:3:4::/96")},
 			blocked: true,
 		},
+		// RFC 6052 section 2.4 example embeddings of 192.0.2.33 (a
+		// blocked documentation address) at every defined prefix
+		// length.
+		{
+			name:    "NSP32BlockedIPv4",
+			addr:    "2001:db8:c000:221::",
+			nat64:   []netip.Prefix{netip.MustParsePrefix("2001:db8::/32")},
+			blocked: true,
+		},
+		{
+			name:    "NSP40BlockedIPv4",
+			addr:    "2001:db8:1c0:2:21::",
+			nat64:   []netip.Prefix{netip.MustParsePrefix("2001:db8:100::/40")},
+			blocked: true,
+		},
+		{
+			name:    "NSP48BlockedIPv4",
+			addr:    "2001:db8:122:c000:2:2100::",
+			nat64:   []netip.Prefix{netip.MustParsePrefix("2001:db8:122::/48")},
+			blocked: true,
+		},
+		{
+			name:    "NSP56BlockedIPv4",
+			addr:    "2001:db8:122:3c0:0:221::",
+			nat64:   []netip.Prefix{netip.MustParsePrefix("2001:db8:122:300::/56")},
+			blocked: true,
+		},
+		{
+			name:    "NSP64BlockedIPv4",
+			addr:    "2001:db8:122:344:c0:2:2100::",
+			nat64:   []netip.Prefix{netip.MustParsePrefix("2001:db8:122:344::/64")},
+			blocked: true,
+		},
+		{
+			name:    "NSP96BlockedIPv4",
+			addr:    "2001:db8:122:344::c000:221",
+			nat64:   []netip.Prefix{netip.MustParsePrefix("2001:db8:122:344::/96")},
+			blocked: true,
+		},
+		// The same layouts embedding public 8.8.8.8. The NSPs sit
+		// inside the otherwise-blocked 2001:db8::/32 documentation
+		// range, so an allowed verdict proves the decode ran.
+		{
+			name:    "NSP32PublicIPv4",
+			addr:    "2001:db8:808:808::",
+			nat64:   []netip.Prefix{netip.MustParsePrefix("2001:db8::/32")},
+			blocked: false,
+		},
+		{
+			name:    "NSP40PublicIPv4",
+			addr:    "2001:db8:108:808:8::",
+			nat64:   []netip.Prefix{netip.MustParsePrefix("2001:db8:100::/40")},
+			blocked: false,
+		},
+		{
+			name:    "NSP48PublicIPv4",
+			addr:    "2001:db8:122:808:8:800::",
+			nat64:   []netip.Prefix{netip.MustParsePrefix("2001:db8:122::/48")},
+			blocked: false,
+		},
+		{
+			name:    "NSP56PublicIPv4",
+			addr:    "2001:db8:122:308:8:808::",
+			nat64:   []netip.Prefix{netip.MustParsePrefix("2001:db8:122:300::/56")},
+			blocked: false,
+		},
+		{
+			name:    "NSP64PublicIPv4",
+			addr:    "2001:db8:122:344:8:808:800:0",
+			nat64:   []netip.Prefix{netip.MustParsePrefix("2001:db8:122:344::/64")},
+			blocked: false,
+		},
+		{
+			name:    "NSP96PublicIPv4",
+			addr:    "2001:db8:122:344::808:808",
+			nat64:   []netip.Prefix{netip.MustParsePrefix("2001:db8:122:344::/96")},
+			blocked: false,
+		},
 		{name: "IPv4CompatibleLoopback", addr: "::127.0.0.1", blocked: true},
 		{name: "IPv4CompatiblePrivate", addr: "::10.0.0.1", blocked: true},
 		{name: "IPv4CompatiblePublic", addr: "::8.8.8.8", blocked: true},
@@ -256,11 +334,20 @@ func TestParseAllowedPrefix(t *testing.T) {
 func TestParseNAT64Prefix(t *testing.T) {
 	t.Parallel()
 
-	prefix, err := ParseNAT64Prefix("64:ff9b:1:2:3:4::/96")
-	require.NoError(t, err)
-	require.Equal(t, netip.MustParsePrefix("64:ff9b:1:2:3:4::/96"), prefix)
+	for _, raw := range []string{
+		"2001:db8::/32",
+		"2001:db8:100::/40",
+		"2001:db8:122::/48",
+		"2001:db8:122:300::/56",
+		"2001:db8:122:344::/64",
+		"64:ff9b:1:2:3:4::/96",
+	} {
+		prefix, err := ParseNAT64Prefix(raw)
+		require.NoError(t, err, raw)
+		require.Equal(t, netip.MustParsePrefix(raw), prefix)
+	}
 
-	for _, raw := range []string{"64:ff9b::/95", "64:ff9b::/97", "10.0.0.0/8", "::ffff:0.0.0.0/96", "garbage"} {
+	for _, raw := range []string{"64:ff9b::/95", "64:ff9b::/97", "2001:db8::/24", "2001:db8::/128", "10.0.0.0/8", "::ffff:0.0.0.0/96", "garbage"} {
 		_, err := ParseNAT64Prefix(raw)
 		require.Error(t, err, raw)
 	}
