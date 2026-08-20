@@ -844,14 +844,32 @@ func TestDefaultDialerMirrorsDefaultTransport(t *testing.T) {
 	require.Equal(t, 30*time.Second, dialer.KeepAlive)
 }
 
-func TestWithDefaultTimeout(t *testing.T) {
+func TestOperationDeadline(t *testing.T) {
 	t.Parallel()
+
+	now := time.Date(2026, time.August, 18, 12, 0, 0, 0, time.UTC)
+	require.True(t, operationDeadline(&net.Dialer{}, now).IsZero())
+	require.Equal(t, now.Add(5*time.Second),
+		operationDeadline(&net.Dialer{Timeout: 5 * time.Second}, now))
+	require.Equal(t, now.Add(time.Minute),
+		operationDeadline(&net.Dialer{Deadline: now.Add(time.Minute)}, now))
+	// The earlier of the two wins, in both orders.
+	require.Equal(t, now.Add(5*time.Second),
+		operationDeadline(&net.Dialer{Timeout: 5 * time.Second, Deadline: now.Add(time.Minute)}, now))
+	require.Equal(t, now.Add(time.Second),
+		operationDeadline(&net.Dialer{Timeout: 5 * time.Second, Deadline: now.Add(time.Second)}, now))
+}
+
+func TestWithDialerDeadline(t *testing.T) {
+	t.Parallel()
+
+	defaultBase := defaultDialer()
 
 	t.Run("InjectsDeadlineWhenAbsent", func(t *testing.T) {
 		t.Parallel()
 
 		var got time.Time
-		dial := withDefaultTimeout(func(ctx context.Context, _, _ string) (net.Conn, error) {
+		dial := withDialerDeadline(defaultBase, func(ctx context.Context, _, _ string) (net.Conn, error) {
 			deadline, ok := ctx.Deadline()
 			require.True(t, ok)
 			got = deadline
@@ -869,7 +887,7 @@ func TestWithDefaultTimeout(t *testing.T) {
 		want := time.Now().Add(time.Second)
 		ctx, cancel := context.WithDeadline(context.Background(), want)
 		defer cancel()
-		dial := withDefaultTimeout(func(ctx context.Context, _, _ string) (net.Conn, error) {
+		dial := withDialerDeadline(defaultBase, func(ctx context.Context, _, _ string) (net.Conn, error) {
 			deadline, ok := ctx.Deadline()
 			require.True(t, ok)
 			require.Equal(t, want, deadline)
@@ -885,7 +903,7 @@ func TestWithDefaultTimeout(t *testing.T) {
 		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(time.Hour))
 		defer cancel()
 		var got time.Time
-		dial := withDefaultTimeout(func(ctx context.Context, _, _ string) (net.Conn, error) {
+		dial := withDialerDeadline(defaultBase, func(ctx context.Context, _, _ string) (net.Conn, error) {
 			deadline, ok := ctx.Deadline()
 			require.True(t, ok)
 			got = deadline
@@ -896,6 +914,48 @@ func TestWithDefaultTimeout(t *testing.T) {
 		require.NoError(t, err)
 		require.WithinRange(t, got, before, before.Add(defaultDialTimeout+time.Minute))
 	})
+
+	t.Run("UnboundedDialerLeavesContextAlone", func(t *testing.T) {
+		t.Parallel()
+
+		dial := withDialerDeadline(&net.Dialer{}, func(ctx context.Context, _, _ string) (net.Conn, error) {
+			_, ok := ctx.Deadline()
+			require.False(t, ok)
+			return nil, nil
+		})
+		_, err := dial(context.Background(), "tcp", "192.0.2.1:80")
+		require.NoError(t, err)
+	})
+}
+
+// A base *net.Dialer's Resolver must be consulted for hostname validation,
+// and its Timeout must bound the whole operation including resolution.
+func TestDialUsesBaseDialerResolverAndTimeout(t *testing.T) {
+	t.Parallel()
+
+	errResolver := errors.New("custom resolver consulted")
+	var sawDeadline atomic.Bool
+	base := &net.Dialer{
+		Timeout: 7 * time.Second,
+		Resolver: &net.Resolver{
+			PreferGo: true,
+			Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				// The whole-operation deadline derived from the base
+				// dialer's Timeout must already bound resolution.
+				_, ok := ctx.Deadline()
+				sawDeadline.Store(ok)
+				return nil, errResolver
+			},
+		},
+	}
+	dial := NewDialContext(base)
+	// A reserved-TLD hostname absent from the hosts file forces a DNS
+	// query through the custom resolver's Dial hook.
+	conn, err := dial(t.Context(), "tcp", "resolver-probe.test:80")
+	require.Nil(t, conn)
+	require.Error(t, err)
+	require.ErrorContains(t, err, "resolve")
+	require.True(t, sawDeadline.Load(), "resolution context had no deadline from the base dialer's Timeout")
 }
 
 func TestDialContextNetworkRestriction(t *testing.T) {

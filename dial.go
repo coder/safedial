@@ -27,21 +27,39 @@ func defaultDialer() *net.Dialer {
 	}
 }
 
-// withDefaultTimeout bounds the whole dial operation, resolution and every
-// connect attempt combined, to defaultDialTimeout unless the caller's
-// deadline is sooner. net.Dialer.Timeout alone is not equivalent: it
-// restarts for each validated address dialed, so multiple black-holed
-// addresses would multiply it, unlike http.DefaultTransport's single
-// connect budget.
-func withDefaultTimeout(
+// operationDeadline mirrors net.Dialer.deadline's Timeout/Deadline
+// handling: the earlier of now+Timeout and Deadline, considering only the
+// ones that are set. A zero time means unbounded.
+func operationDeadline(dialer *net.Dialer, now time.Time) time.Time {
+	var earliest time.Time
+	if dialer.Timeout != 0 {
+		earliest = now.Add(dialer.Timeout)
+	}
+	if !dialer.Deadline.IsZero() && (earliest.IsZero() || dialer.Deadline.Before(earliest)) {
+		earliest = dialer.Deadline
+	}
+	return earliest
+}
+
+// withDialerDeadline bounds the whole dial operation, resolution and every
+// connect attempt combined, by the dialer's Timeout and Deadline unless the
+// caller's deadline is sooner. The dialer's own settings alone are not
+// equivalent: they apply per DialContext call, restarting the budget for
+// each validated address dialed (so multiple black-holed addresses would
+// multiply it, unlike http.DefaultTransport's single connect budget) and
+// leaving hostname resolution unbounded.
+func withDialerDeadline(
+	dialer *net.Dialer,
 	next func(ctx context.Context, network, addr string) (net.Conn, error),
 ) func(ctx context.Context, network, addr string) (net.Conn, error) {
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
-		limit := time.Now().Add(defaultDialTimeout)
-		if deadline, ok := ctx.Deadline(); !ok || deadline.After(limit) {
-			var cancel context.CancelFunc
-			ctx, cancel = context.WithDeadline(ctx, limit)
-			defer cancel()
+		limit := operationDeadline(dialer, time.Now())
+		if !limit.IsZero() {
+			if deadline, ok := ctx.Deadline(); !ok || deadline.After(limit) {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithDeadline(ctx, limit)
+				defer cancel()
+			}
 		}
 		return next(ctx, network, addr)
 	}
@@ -49,12 +67,13 @@ func withDefaultTimeout(
 
 // NewDialContext returns a DialContext function that validates every
 // destination against the policy before connecting through base. A nil base
-// uses a dialer with http.DefaultTransport's timeout and keep-alive, and
-// bounds each whole dial operation, resolution and all connect attempts
-// combined, by that timeout unless the caller's deadline is sooner. A
-// non-nil base keeps its own timeout configuration and is bounded only by
-// the caller's context, so pass a context with a deadline or configure the
-// base's timeouts. Only tcp, tcp4, and tcp6 networks are permitted.
+// uses a dialer with http.DefaultTransport's timeout and keep-alive. A base
+// *net.Dialer's Timeout and Deadline bound each whole dial operation,
+// resolution and all connect attempts combined, unless the caller's
+// deadline is sooner, and its Resolver, when set, resolves hostnames for
+// validation. Any other ContextDialer implementation is bounded only by
+// the caller's context, so pass a context with a deadline. Only tcp, tcp4,
+// and tcp6 networks are permitted.
 //
 // Hostnames are resolved first and each resolved address is validated; the
 // connection is then made to a validated IP directly, so a hostile resolver
@@ -76,15 +95,17 @@ func NewDialContext(base ContextDialer, opts ...Option) func(ctx context.Context
 }
 
 func (c *config) dialFunc(base ContextDialer) func(ctx context.Context, network, addr string) (net.Conn, error) {
-	if base != nil {
-		return func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return c.dial(ctx, base, network, addr)
-		}
+	dialer := base
+	if dialer == nil {
+		dialer = defaultDialer()
 	}
-	dialer := defaultDialer()
-	return withDefaultTimeout(func(ctx context.Context, network, addr string) (net.Conn, error) {
+	next := func(ctx context.Context, network, addr string) (net.Conn, error) {
 		return c.dial(ctx, dialer, network, addr)
-	})
+	}
+	if d, ok := dialer.(*net.Dialer); ok {
+		return withDialerDeadline(d, next)
+	}
+	return next
 }
 
 func (c *config) dial(
@@ -113,7 +134,15 @@ func (c *config) dial(
 		}
 		return dialer.DialContext(ctx, network, addr)
 	}
-	ips, err := net.DefaultResolver.LookupNetIP(ctx, lookupNetwork, host)
+	// A base *net.Dialer's own resolver handles hostname validation so
+	// guarded dials see the same answers the dialer would normally use
+	// (split-horizon DNS, dedicated servers); the dialer itself is only
+	// ever handed validated IP literals afterwards.
+	resolver := net.DefaultResolver
+	if d, ok := dialer.(*net.Dialer); ok && d.Resolver != nil {
+		resolver = d.Resolver
+	}
+	ips, err := resolver.LookupNetIP(ctx, lookupNetwork, host)
 	if err != nil {
 		return nil, fmt.Errorf("resolve %q: %w", host, err)
 	}
