@@ -184,11 +184,15 @@ func validateNAT64Prefix(prefix netip.Prefix) error {
 }
 
 // CheckAddr validates a single IP address against the destination policy.
-// It returns a *BlockedError when the address is blocked and nil otherwise.
-// Use it for pre-checks on caller-supplied IP literals; hostname-based
+// It returns a *BlockedError when the address is blocked, an error when the
+// address is invalid (such as the zero netip.Addr), and nil otherwise. Use
+// it for pre-checks on caller-supplied IP literals; hostname-based
 // destinations must go through the guarded dialer instead so the
 // post-resolution addresses are what get validated.
 func CheckAddr(addr netip.Addr, opts ...Option) error {
+	if !addr.IsValid() {
+		return fmt.Errorf("invalid address")
+	}
 	cfg := newConfig(opts)
 	if cfg.isBlockedAddr(addr) {
 		return &BlockedError{Host: addr.String(), Addr: addr.WithZone("").Unmap()}
@@ -198,8 +202,12 @@ func CheckAddr(addr netip.Addr, opts ...Option) error {
 
 // IPv4-mapped addresses are unmapped and IPv6 zones are stripped before
 // checking so address forms cannot bypass prefix policy. Allowed prefixes
-// take precedence.
+// take precedence. An invalid address matches no predicate or prefix, so it
+// is blocked explicitly to fail closed.
 func (c *config) isBlockedAddr(addr netip.Addr) bool {
+	if !addr.IsValid() {
+		return true
+	}
 	addr = addr.WithZone("").Unmap()
 	for _, prefix := range c.allowed {
 		if prefix.Contains(addr) {

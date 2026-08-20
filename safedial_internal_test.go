@@ -272,6 +272,18 @@ func TestCheckAddr(t *testing.T) {
 		netip.MustParseAddr("10.0.0.1"),
 		WithAllowedPrefixes(netip.MustParsePrefix("10.0.0.0/8")),
 	))
+
+	require.ErrorContains(t, CheckAddr(netip.Addr{}), "invalid address")
+}
+
+func TestIsBlockedAddrFailsClosedOnInvalid(t *testing.T) {
+	t.Parallel()
+
+	// The zero Addr matches no classification predicate or prefix; it
+	// must be blocked, not approved, even when an allowlist exists.
+	require.True(t, newConfig(nil).isBlockedAddr(netip.Addr{}))
+	cfg := newConfig([]Option{WithAllowedPrefixes(netip.MustParsePrefix("0.0.0.0/0"))})
+	require.True(t, cfg.isBlockedAddr(netip.Addr{}))
 }
 
 func TestParseAllowedPrefix(t *testing.T) {
