@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"slices"
 	"syscall"
 	"time"
 )
@@ -167,14 +168,7 @@ func (c *config) dial(
 		if err != nil {
 			return nil, err
 		}
-		allowed := false
-		for _, allowedPort := range c.ports {
-			if int(allowedPort) == portNumber {
-				allowed = true
-				break
-			}
-		}
-		if !allowed {
+		if !slices.Contains(c.ports, uint16(portNumber)) {
 			return nil, &PortBlockedError{Host: host, Port: uint16(portNumber)}
 		}
 	}
