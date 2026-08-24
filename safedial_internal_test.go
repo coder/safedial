@@ -329,7 +329,7 @@ func TestCheckAddr(t *testing.T) {
 	require.ErrorAs(t, err, &blockedErr)
 	require.Equal(t, "64:ff9b::a00:1", blockedErr.Host)
 	require.Equal(t, netip.MustParseAddr("10.0.0.1"), blockedErr.Addr)
-	require.ErrorContains(t, err, "10.0.0.1 is in a private or reserved range")
+	require.ErrorContains(t, err, "10.0.0.1 is not allowed by the destination policy")
 }
 
 func TestIsBlockedAddrFailsClosedOnInvalid(t *testing.T) {
@@ -913,6 +913,33 @@ func TestWithAllowedPorts(t *testing.T) {
 		require.Equal(t, uint16(443), portErr.Port)
 		require.Zero(t, resolverCalls.Load())
 	})
+
+	t.Run("ServiceNamePinnedNumeric", func(t *testing.T) {
+		t.Parallel()
+
+		// The validated numeric port must replace a service name before
+		// the downstream dialer sees the address: a dialer resolving the
+		// name itself could reach a different port than the one checked.
+		errProbe := errors.New("dial probe")
+		var got []string
+		base := dialerFunc(func(_ context.Context, _, addr string) (net.Conn, error) {
+			got = append(got, addr)
+			return nil, errProbe
+		})
+		dial := NewDialContext(base, WithAllowedPorts(80))
+		conn, err := dial(testContext(t, testWait), "tcp", "8.8.8.8:http")
+		require.Nil(t, conn)
+		require.ErrorIs(t, err, errProbe)
+		require.Equal(t, []string{"8.8.8.8:80"}, got)
+	})
+}
+
+// dialerFunc adapts a function to ContextDialer for observing the address a
+// guarded dial hands to its base dialer.
+type dialerFunc func(ctx context.Context, network, addr string) (net.Conn, error)
+
+func (f dialerFunc) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	return f(ctx, network, addr)
 }
 
 func TestDialValidatedIPs(t *testing.T) {

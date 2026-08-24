@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/netip"
 	"slices"
+	"strconv"
 	"syscall"
 	"time"
 )
@@ -171,6 +172,11 @@ func (c *config) dial(
 		if !slices.Contains(c.ports, uint16(portNumber)) {
 			return nil, &PortBlockedError{Host: host, Port: uint16(portNumber)}
 		}
+		// Pin the validated numeric port: a downstream dialer could
+		// resolve a service name to a different number than the check
+		// above did.
+		port = strconv.Itoa(portNumber)
+		addr = net.JoinHostPort(host, port)
 	}
 	if ip, parseErr := netip.ParseAddr(host); parseErr == nil {
 		if bad, blocked := c.blockedAddr(ip); blocked {

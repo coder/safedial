@@ -202,13 +202,15 @@ type BlockedError struct {
 	// Addr is the IP address the block verdict applied to, with any IPv6
 	// zone stripped and IPv4-mapped form unmapped. For NAT64 translation
 	// forms this is the embedded IPv4 destination that was blocked, not
-	// the outer IPv6 address.
+	// the outer IPv6 address, unless a WithBlockedPrefixes rule matched
+	// the outer translation form itself, in which case it is that outer
+	// address.
 	Addr netip.Addr
 }
 
 func (e *BlockedError) Error() string {
 	return fmt.Sprintf(
-		"connection to %q blocked: %s is in a private or reserved range not allowed by policy",
+		"connection to %q blocked: %s is not allowed by the destination policy",
 		e.Host, e.Addr,
 	)
 }
