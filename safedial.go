@@ -126,6 +126,12 @@ func WithAllowedPrefixes(prefixes ...netip.Prefix) Option {
 // operator-supplied values with ParseAllowedPrefix so IPv4-mapped IPv6 forms
 // cannot bypass the policy.
 //
+// A prefix covering NAT64 translation forms matches the outer IPv6 address
+// before its embedded IPv4 destination is decoded, so blocking a
+// translator's range blocks the translator itself regardless of what it
+// embeds; that outer match is the one place a caller block precedes the
+// allowlist, which only ever matches decoded destinations.
+//
 // IPv4-mapped IPv6 prefixes are converted to their IPv4 equivalents, same as
 // WithAllowedPrefixes; a mapped prefix shorter than 96 bits cannot be
 // represented as an IPv4 range and panics.
@@ -301,11 +307,21 @@ func (c *config) blockedAddr(addr netip.Addr) (netip.Addr, bool) {
 		return addr, true
 	}
 	addr = addr.WithZone("").Unmap()
+	// Caller blocks match the outer translation form before decoding: a
+	// deny rule on a translator's range must block the translator itself,
+	// not vanish behind the embedded destination. Allowed prefixes still
+	// match only the decoded destination.
 	if wellKnownNAT64Prefix.Contains(addr) {
+		if c.callerBlocked(addr) {
+			return addr, true
+		}
 		return c.blockedAddr(embeddedIPv4(addr, 96))
 	}
 	for _, prefix := range c.nat64 {
 		if prefix.Contains(addr) {
+			if c.callerBlocked(addr) {
+				return addr, true
+			}
 			return c.blockedAddr(embeddedIPv4(addr, prefix.Bits()))
 		}
 	}
@@ -314,10 +330,8 @@ func (c *config) blockedAddr(addr netip.Addr) (netip.Addr, bool) {
 			return addr, false
 		}
 	}
-	for _, prefix := range c.blocked {
-		if prefix.Contains(addr) {
-			return addr, true
-		}
+	if c.callerBlocked(addr) {
+		return addr, true
 	}
 	if addr.IsLoopback() ||
 		addr.IsPrivate() ||
@@ -334,6 +348,15 @@ func (c *config) blockedAddr(addr netip.Addr) (netip.Addr, bool) {
 		}
 	}
 	return addr, false
+}
+
+func (c *config) callerBlocked(addr netip.Addr) bool {
+	for _, prefix := range c.blocked {
+		if prefix.Contains(addr) {
+			return true
+		}
+	}
+	return false
 }
 
 // embeddedIPv4 extracts the IPv4 address from an RFC 6052 translation

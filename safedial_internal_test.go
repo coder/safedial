@@ -431,6 +431,48 @@ func TestWithBlockedPrefixes(t *testing.T) {
 	require.Equal(t, netip.MustParseAddr("8.8.8.8"), blockedErr.Addr)
 }
 
+func TestWithBlockedPrefixesOuterNAT64(t *testing.T) {
+	t.Parallel()
+
+	// Blocking a translator's own range must block the translator itself:
+	// the outer form is matched before the embedded IPv4 is decoded, even
+	// when the embedded destination is public or explicitly allowed.
+	outer := netip.MustParseAddr("64:ff9b::808:808")
+	cfg := newConfig([]Option{
+		WithBlockedPrefixes(netip.MustParsePrefix("64:ff9b::/96")),
+	})
+	bad, blocked := cfg.blockedAddr(outer)
+	require.True(t, blocked)
+	require.Equal(t, outer, bad)
+	// The embedded destination stays reachable directly.
+	require.False(t, cfg.isBlockedAddr(netip.MustParseAddr("8.8.8.8")))
+
+	cfg = newConfig([]Option{
+		WithBlockedPrefixes(netip.MustParsePrefix("64:ff9b::/96")),
+		WithAllowedPrefixes(netip.MustParsePrefix("8.8.8.0/24")),
+	})
+	require.True(t, cfg.isBlockedAddr(outer))
+	require.False(t, cfg.isBlockedAddr(netip.MustParseAddr("8.8.8.8")))
+
+	// Same for operator-declared RFC 8215 prefixes.
+	nat64 := netip.MustParsePrefix("2001:db8:122:344::/64")
+	cfg = newConfig([]Option{
+		WithNAT64Prefixes(nat64),
+		WithBlockedPrefixes(nat64),
+	})
+	require.True(t, cfg.isBlockedAddr(netip.MustParseAddr("2001:db8:122:344:8:808:800:0")))
+	require.False(t, cfg.isBlockedAddr(netip.MustParseAddr("8.8.8.8")))
+
+	// A caller block on the embedded range still applies after decoding.
+	cfg = newConfig([]Option{
+		WithNAT64Prefixes(nat64),
+		WithBlockedPrefixes(netip.MustParsePrefix("8.8.8.0/24")),
+	})
+	bad, blocked = cfg.blockedAddr(netip.MustParseAddr("2001:db8:122:344:8:808:800:0"))
+	require.True(t, blocked)
+	require.Equal(t, netip.MustParseAddr("8.8.8.8"), bad)
+}
+
 func TestParseNAT64Prefix(t *testing.T) {
 	t.Parallel()
 
