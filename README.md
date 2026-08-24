@@ -22,8 +22,9 @@ its own network position and credentials.
   A resolver that answers with any blocked address fails the whole dial
   rather than racing it. TLS verification still uses the hostname.
 - **Checks again at connect time.** Connections made by `net.Dialer` pass a
-  second address-policy check at the socket seam, independent of the
-  resolution and pinning logic.
+  second policy check at the socket seam — the address policy and, when
+  configured, the port allowlist — independent of the resolution and
+  pinning logic.
 - **Decodes NAT64.** Addresses under the RFC 6052 well-known prefix
   `64:ff9b::/96` (and operator-declared RFC 8215 prefixes) have their
   embedded IPv4 destination extracted and validated with the full IPv4

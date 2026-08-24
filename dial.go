@@ -35,9 +35,20 @@ func (c *config) guardDialer(d *net.Dialer) *net.Dialer {
 	callerControlContext := d.ControlContext
 	callerControl := d.Control
 	guarded.ControlContext = func(ctx context.Context, network, address string, rawConn syscall.RawConn) error {
-		host, _, err := net.SplitHostPort(address)
+		host, portStr, err := net.SplitHostPort(address)
 		if err != nil {
 			return fmt.Errorf("split connect address %q: %w", address, err)
+		}
+		// Connect-time addresses always carry a numeric port; anything
+		// else fails closed, same as an unparsable host.
+		if len(c.ports) > 0 {
+			port, err := strconv.ParseUint(portStr, 10, 16)
+			if err != nil {
+				return fmt.Errorf("parse connect port %q: %w", portStr, err)
+			}
+			if !slices.Contains(c.ports, uint16(port)) {
+				return &PortBlockedError{Host: host, Port: uint16(port)}
+			}
 		}
 		ip, err := netip.ParseAddr(host)
 		if err != nil {
@@ -109,8 +120,9 @@ func withDialerDeadline(
 // connection is then made to a validated IP directly, so a hostile resolver
 // cannot rebind the name between validation and dialing. IP literals keep
 // their IPv6 zone when dialed. Connections made by a *net.Dialer, including
-// the nil-base default, are checked again at the socket seam. Custom dialers
-// rely on the resolve-and-pin validation alone because they cannot carry a
+// the nil-base default, are checked again at the socket seam: the address
+// policy and, when configured, the port allowlist. Custom dialers rely on
+// the resolve-and-pin validation alone because they cannot carry a
 // net.Dialer Control hook.
 //
 // When a hostname resolves to both address families, the validated
@@ -167,7 +179,7 @@ func (c *config) dial(
 	if len(c.ports) > 0 {
 		portNumber, err := net.DefaultResolver.LookupPort(ctx, network, port)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("resolve port %q: %w", port, err)
 		}
 		if !slices.Contains(c.ports, uint16(portNumber)) {
 			return nil, &PortBlockedError{Host: host, Port: uint16(portNumber)}

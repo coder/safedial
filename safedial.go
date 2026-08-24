@@ -134,10 +134,16 @@ func WithAllowedPrefixes(prefixes ...netip.Prefix) Option {
 //
 // IPv4-mapped IPv6 prefixes are converted to their IPv4 equivalents, same as
 // WithAllowedPrefixes; a mapped prefix shorter than 96 bits cannot be
-// represented as an IPv4 range and panics.
+// represented as an IPv4 range and panics. An invalid prefix (the zero
+// netip.Prefix or one built from bad PrefixFrom arguments) contains no
+// addresses, which would turn the deny rule into a silent no-op, so it
+// panics as well.
 func WithBlockedPrefixes(prefixes ...netip.Prefix) Option {
 	normalized := make([]netip.Prefix, len(prefixes))
 	for i, prefix := range prefixes {
+		if !prefix.IsValid() {
+			panic(fmt.Sprintf("safedial: blocked prefix %q: prefix is not valid", prefix))
+		}
 		if prefix.Addr().Is4In6() {
 			if prefix.Bits() < 96 {
 				panic(fmt.Sprintf(
@@ -157,7 +163,9 @@ func WithBlockedPrefixes(prefixes ...netip.Prefix) Option {
 // WithAllowedPorts restricts connections to the given ports. An empty list
 // leaves ports unrestricted. This is dial-layer policy and applies to every
 // connection, including redirect hops; validating schemes and hostnames
-// remains the caller's responsibility.
+// remains the caller's responsibility. Connections made by a *net.Dialer
+// re-check the port at connect time, the same backstop applied to the
+// address policy.
 func WithAllowedPorts(ports ...uint16) Option {
 	return func(cfg *config) {
 		cfg.ports = append(cfg.ports, ports...)
