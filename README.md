@@ -93,6 +93,28 @@ applies the same policy and accepts the same options.
 - **It does not sandbox the response.** What the caller does with fetched
   bytes is out of scope.
 
+## Alternatives
+
+[doyensec/safeurl](https://github.com/doyensec/safeurl) represents a wrapper
+client design. Its strength is a self-contained client with one-stop URL
+policy: scheme and port allowlists, an exact-host allowlist, and credentials in
+URLs blocked by default. If an application wants a single library that handles
+both URL validation and IP policy, a wrapper client is more complete.
+
+safedial makes a different tradeoff. It does no URL-level filtering by design;
+callers validate URLs and schemes before making requests. Wrapper-level URL
+checks apply to requests made through the wrapper's own methods. safedial's
+policy lives at the dial layer, so every connection made through the guarded
+transport is covered by construction, including redirect hops, HTTP/2, and any
+code handed the `*http.Client`.
+
+safedial also decodes NAT64 addresses and validates the embedded IPv4 address
+rather than blanket-blocking the prefix. Its allowlists carve out exceptions
+from the default denylist rather than switching to allowlist-only mode. A
+resolver answer containing any blocked address fails the whole dial,
+configuration problems are returned as errors, and IPv6 remains usable with
+Happy Eyeballs preserved.
+
 ## Stability
 
 The address policy (which ranges are blocked) may gain new special-use
