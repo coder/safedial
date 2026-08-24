@@ -108,8 +108,8 @@ the `*http.Client`.
 safedial also decodes NAT64 addresses and validates the embedded IPv4 address
 instead of blocking the entire prefix. Its allowlists add exceptions to the
 default denylist instead of switching to allowlist-only mode. If a resolver
-returns any blocked address, the whole dial fails. Configuration problems are
-returned as errors, while IPv6 remains usable with Happy Eyeballs preserved.
+returns any blocked address, the whole dial fails. IPv6 remains usable with
+Happy Eyeballs preserved.
 
 ## Stability
 
