@@ -21,6 +21,9 @@ its own network position and credentials.
   address is validated, and the connection goes to a validated IP directly.
   A resolver that answers with any blocked address fails the whole dial
   rather than racing it. TLS verification still uses the hostname.
+- **Checks again at connect time.** Connections made by `net.Dialer` pass a
+  second address-policy check at the socket seam, independent of the
+  resolution and pinning logic.
 - **Decodes NAT64.** Addresses under the RFC 6052 well-known prefix
   `64:ff9b::/96` (and operator-declared RFC 8215 prefixes) have their
   embedded IPv4 destination extracted and validated with the full IPv4
@@ -42,6 +45,9 @@ its own network position and credentials.
   precedence over every block rule. NAT64 forms are decoded before the
   allowlist is consulted, so allowing a translator's IPv6 range cannot
   skip validation of the IPv4 destinations it embeds.
+- **Supports caller-defined connection policy.** Deployments can add blocked
+  CIDRs and opt in to a port allowlist for every guarded connection, including
+  redirect hops.
 - **Splits dial deadlines, keeps Happy Eyeballs.** The remaining deadline
   is divided across resolved addresses so one black-holed address cannot
   consume the whole budget, and dual-stack destinations keep net.Dialer's
@@ -88,8 +94,9 @@ applies the same policy and accepts the same options.
   legitimately lives on an internal address, and the operator already
   controls the process. Wrapping those breaks real deployments without
   crossing a trust boundary.
-- **It does not filter by port, scheme, or hostname.** Policy is applied to
-  resolved IP addresses. Validate URLs and schemes before making requests.
+- **It does not filter by scheme or hostname.** Validate URLs before making
+  requests. Port filtering is available as opt-in dial-layer policy through
+  `WithAllowedPorts`.
 - **It does not sandbox the response.** What the caller does with fetched
   bytes is out of scope.
 

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"syscall"
 	"time"
 )
 
@@ -25,6 +26,33 @@ func defaultDialer() *net.Dialer {
 		Timeout:   defaultDialTimeout,
 		KeepAlive: 30 * time.Second,
 	}
+}
+
+func (c *config) guardDialer(d *net.Dialer) *net.Dialer {
+	guarded := *d
+	callerControlContext := d.ControlContext
+	callerControl := d.Control
+	guarded.ControlContext = func(ctx context.Context, network, address string, rawConn syscall.RawConn) error {
+		host, _, err := net.SplitHostPort(address)
+		if err != nil {
+			return fmt.Errorf("split connect address %q: %w", address, err)
+		}
+		ip, err := netip.ParseAddr(host)
+		if err != nil {
+			return fmt.Errorf("parse connect address %q: %w", host, err)
+		}
+		if bad, blocked := c.blockedAddr(ip); blocked {
+			return &BlockedError{Host: host, Addr: bad}
+		}
+		if callerControlContext != nil {
+			return callerControlContext(ctx, network, address, rawConn)
+		}
+		if callerControl != nil {
+			return callerControl(network, address, rawConn)
+		}
+		return nil
+	}
+	return &guarded
 }
 
 // operationDeadline mirrors net.Dialer.deadline's Timeout/Deadline
@@ -78,7 +106,10 @@ func withDialerDeadline(
 // Hostnames are resolved first and each resolved address is validated; the
 // connection is then made to a validated IP directly, so a hostile resolver
 // cannot rebind the name between validation and dialing. IP literals keep
-// their IPv6 zone when dialed.
+// their IPv6 zone when dialed. Connections made by a *net.Dialer, including
+// the nil-base default, are checked again at the socket seam. Custom dialers
+// rely on the resolve-and-pin validation alone because they cannot carry a
+// net.Dialer Control hook.
 //
 // When a hostname resolves to both address families, the validated
 // addresses are dialed with net.Dialer's Happy Eyeballs behavior: the
@@ -114,6 +145,9 @@ func (c *config) dial(
 	network string,
 	addr string,
 ) (net.Conn, error) {
+	if d, ok := dialer.(*net.Dialer); ok {
+		dialer = c.guardDialer(d)
+	}
 	lookupNetwork := "ip"
 	switch network {
 	case "tcp":
@@ -127,6 +161,22 @@ func (c *config) dial(
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
 		return nil, fmt.Errorf("split host/port %q: %w", addr, err)
+	}
+	if len(c.ports) > 0 {
+		portNumber, err := net.DefaultResolver.LookupPort(ctx, network, port)
+		if err != nil {
+			return nil, err
+		}
+		allowed := false
+		for _, allowedPort := range c.ports {
+			if int(allowedPort) == portNumber {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return nil, &PortBlockedError{Host: host, Port: uint16(portNumber)}
+		}
 	}
 	if ip, parseErr := netip.ParseAddr(host); parseErr == nil {
 		if bad, blocked := c.blockedAddr(ip); blocked {

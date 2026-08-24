@@ -69,7 +69,9 @@ var extraBlockedPrefixes = []netip.Prefix{
 
 type config struct {
 	allowed  []netip.Prefix
+	blocked  []netip.Prefix
 	nat64    []netip.Prefix
+	ports    []uint16
 	redirect RedirectPolicy
 }
 
@@ -115,6 +117,44 @@ func WithAllowedPrefixes(prefixes ...netip.Prefix) Option {
 	}
 	return func(cfg *config) {
 		cfg.allowed = append(cfg.allowed, normalized...)
+	}
+}
+
+// WithBlockedPrefixes blocks destinations inside the given CIDRs. Allowed
+// prefixes take precedence over caller-supplied blocks, so narrow the allowed
+// prefixes instead when part of an allowed range must remain blocked. Parse
+// operator-supplied values with ParseAllowedPrefix so IPv4-mapped IPv6 forms
+// cannot bypass the policy.
+//
+// IPv4-mapped IPv6 prefixes are converted to their IPv4 equivalents, same as
+// WithAllowedPrefixes; a mapped prefix shorter than 96 bits cannot be
+// represented as an IPv4 range and panics.
+func WithBlockedPrefixes(prefixes ...netip.Prefix) Option {
+	normalized := make([]netip.Prefix, len(prefixes))
+	for i, prefix := range prefixes {
+		if prefix.Addr().Is4In6() {
+			if prefix.Bits() < 96 {
+				panic(fmt.Sprintf(
+					"safedial: blocked prefix %q: IPv4-mapped IPv6 prefix length must be at least 96 bits",
+					prefix,
+				))
+			}
+			prefix = netip.PrefixFrom(prefix.Addr().Unmap(), prefix.Bits()-96)
+		}
+		normalized[i] = prefix
+	}
+	return func(cfg *config) {
+		cfg.blocked = append(cfg.blocked, normalized...)
+	}
+}
+
+// WithAllowedPorts restricts connections to the given ports. An empty list
+// leaves ports unrestricted. This is dial-layer policy and applies to every
+// connection, including redirect hops; validating schemes and hostnames
+// remains the caller's responsibility.
+func WithAllowedPorts(ports ...uint16) Option {
+	return func(cfg *config) {
+		cfg.ports = append(cfg.ports, ports...)
 	}
 }
 
@@ -165,6 +205,18 @@ func (e *BlockedError) Error() string {
 		"connection to %q blocked: %s is in a private or reserved range not allowed by policy",
 		e.Host, e.Addr,
 	)
+}
+
+// PortBlockedError reports a destination rejected by the port policy. Use
+// errors.As, as with BlockedError, to map policy rejections to caller-facing
+// validation errors.
+type PortBlockedError struct {
+	Host string
+	Port uint16
+}
+
+func (e *PortBlockedError) Error() string {
+	return fmt.Sprintf("connection to %q blocked: port %d is not allowed by policy", e.Host, e.Port)
 }
 
 // ParseAllowedPrefix parses an allowed CIDR and converts IPv4-mapped IPv6
@@ -260,6 +312,11 @@ func (c *config) blockedAddr(addr netip.Addr) (netip.Addr, bool) {
 	for _, prefix := range c.allowed {
 		if prefix.Contains(addr) {
 			return addr, false
+		}
+	}
+	for _, prefix := range c.blocked {
+		if prefix.Contains(addr) {
+			return addr, true
 		}
 	}
 	if addr.IsLoopback() ||
