@@ -69,7 +69,9 @@ var extraBlockedPrefixes = []netip.Prefix{
 
 type config struct {
 	allowed  []netip.Prefix
+	blocked  []netip.Prefix
 	nat64    []netip.Prefix
+	ports    []uint16
 	redirect RedirectPolicy
 }
 
@@ -118,6 +120,58 @@ func WithAllowedPrefixes(prefixes ...netip.Prefix) Option {
 	}
 }
 
+// WithBlockedPrefixes blocks destinations inside the given CIDRs. Allowed
+// prefixes take precedence over caller-supplied blocks, so narrow the allowed
+// prefixes instead when part of an allowed range must remain blocked. Parse
+// operator-supplied values with ParseAllowedPrefix so IPv4-mapped IPv6 forms
+// cannot bypass the policy.
+//
+// A prefix covering NAT64 translation forms matches the outer IPv6 address
+// before its embedded IPv4 destination is decoded, so blocking a
+// translator's range blocks the translator itself regardless of what it
+// embeds; that outer match is the one place a caller block precedes the
+// allowlist, which only ever matches decoded destinations.
+//
+// IPv4-mapped IPv6 prefixes are converted to their IPv4 equivalents, same as
+// WithAllowedPrefixes; a mapped prefix shorter than 96 bits cannot be
+// represented as an IPv4 range and panics. An invalid prefix (the zero
+// netip.Prefix or one built from bad PrefixFrom arguments) contains no
+// addresses, which would turn the deny rule into a silent no-op, so it
+// panics as well.
+func WithBlockedPrefixes(prefixes ...netip.Prefix) Option {
+	normalized := make([]netip.Prefix, len(prefixes))
+	for i, prefix := range prefixes {
+		if !prefix.IsValid() {
+			panic(fmt.Sprintf("safedial: blocked prefix %q: prefix is not valid", prefix))
+		}
+		if prefix.Addr().Is4In6() {
+			if prefix.Bits() < 96 {
+				panic(fmt.Sprintf(
+					"safedial: blocked prefix %q: IPv4-mapped IPv6 prefix length must be at least 96 bits",
+					prefix,
+				))
+			}
+			prefix = netip.PrefixFrom(prefix.Addr().Unmap(), prefix.Bits()-96)
+		}
+		normalized[i] = prefix
+	}
+	return func(cfg *config) {
+		cfg.blocked = append(cfg.blocked, normalized...)
+	}
+}
+
+// WithAllowedPorts restricts connections to the given ports. An empty list
+// leaves ports unrestricted. This is dial-layer policy and applies to every
+// connection, including redirect hops; validating schemes and hostnames
+// remains the caller's responsibility. Connections made by a *net.Dialer
+// re-check the port at connect time, the same backstop applied to the
+// address policy.
+func WithAllowedPorts(ports ...uint16) Option {
+	return func(cfg *config) {
+		cfg.ports = append(cfg.ports, ports...)
+	}
+}
+
 // WithNAT64Prefixes declares deployment-specific NAT64 translation prefixes
 // (RFC 8215 network-specific prefixes). Addresses inside a declared prefix
 // have their embedded IPv4 destination extracted and validated with the full
@@ -156,15 +210,29 @@ type BlockedError struct {
 	// Addr is the IP address the block verdict applied to, with any IPv6
 	// zone stripped and IPv4-mapped form unmapped. For NAT64 translation
 	// forms this is the embedded IPv4 destination that was blocked, not
-	// the outer IPv6 address.
+	// the outer IPv6 address, unless a WithBlockedPrefixes rule matched
+	// the outer translation form itself, in which case it is that outer
+	// address.
 	Addr netip.Addr
 }
 
 func (e *BlockedError) Error() string {
 	return fmt.Sprintf(
-		"connection to %q blocked: %s is in a private or reserved range not allowed by policy",
+		"connection to %q blocked: %s is not allowed by the destination policy",
 		e.Host, e.Addr,
 	)
+}
+
+// PortBlockedError reports a destination rejected by the port policy. Use
+// errors.As, as with BlockedError, to map policy rejections to caller-facing
+// validation errors.
+type PortBlockedError struct {
+	Host string
+	Port uint16
+}
+
+func (e *PortBlockedError) Error() string {
+	return fmt.Sprintf("connection to %q blocked: port %d is not allowed by policy", e.Host, e.Port)
 }
 
 // ParseAllowedPrefix parses an allowed CIDR and converts IPv4-mapped IPv6
@@ -249,11 +317,21 @@ func (c *config) blockedAddr(addr netip.Addr) (netip.Addr, bool) {
 		return addr, true
 	}
 	addr = addr.WithZone("").Unmap()
+	// Caller blocks match the outer translation form before decoding: a
+	// deny rule on a translator's range must block the translator itself,
+	// not vanish behind the embedded destination. Allowed prefixes still
+	// match only the decoded destination.
 	if wellKnownNAT64Prefix.Contains(addr) {
+		if c.callerBlocked(addr) {
+			return addr, true
+		}
 		return c.blockedAddr(embeddedIPv4(addr, 96))
 	}
 	for _, prefix := range c.nat64 {
 		if prefix.Contains(addr) {
+			if c.callerBlocked(addr) {
+				return addr, true
+			}
 			return c.blockedAddr(embeddedIPv4(addr, prefix.Bits()))
 		}
 	}
@@ -261,6 +339,9 @@ func (c *config) blockedAddr(addr netip.Addr) (netip.Addr, bool) {
 		if prefix.Contains(addr) {
 			return addr, false
 		}
+	}
+	if c.callerBlocked(addr) {
+		return addr, true
 	}
 	if addr.IsLoopback() ||
 		addr.IsPrivate() ||
@@ -277,6 +358,15 @@ func (c *config) blockedAddr(addr netip.Addr) (netip.Addr, bool) {
 		}
 	}
 	return addr, false
+}
+
+func (c *config) callerBlocked(addr netip.Addr) bool {
+	for _, prefix := range c.blocked {
+		if prefix.Contains(addr) {
+			return true
+		}
+	}
+	return false
 }
 
 // embeddedIPv4 extracts the IPv4 address from an RFC 6052 translation

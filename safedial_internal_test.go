@@ -329,7 +329,7 @@ func TestCheckAddr(t *testing.T) {
 	require.ErrorAs(t, err, &blockedErr)
 	require.Equal(t, "64:ff9b::a00:1", blockedErr.Host)
 	require.Equal(t, netip.MustParseAddr("10.0.0.1"), blockedErr.Addr)
-	require.ErrorContains(t, err, "10.0.0.1 is in a private or reserved range")
+	require.ErrorContains(t, err, "10.0.0.1 is not allowed by the destination policy")
 }
 
 func TestIsBlockedAddrFailsClosedOnInvalid(t *testing.T) {
@@ -397,6 +397,91 @@ func TestParseAllowedPrefix(t *testing.T) {
 			require.False(t, cfg.isBlockedAddr(netip.MustParseAddr(tc.addr)))
 		})
 	}
+}
+
+func TestWithBlockedPrefixes(t *testing.T) {
+	t.Parallel()
+
+	blockedPublic := netip.MustParsePrefix("8.8.8.0/24")
+	cfg := newConfig([]Option{WithBlockedPrefixes(blockedPublic)})
+	require.True(t, cfg.isBlockedAddr(netip.MustParseAddr("8.8.8.8")))
+	require.False(t, cfg.isBlockedAddr(netip.MustParseAddr("8.8.4.4")))
+	require.True(t, cfg.isBlockedAddr(netip.MustParseAddr("64:ff9b::808:808")))
+
+	cfg = newConfig([]Option{
+		WithAllowedPrefixes(netip.MustParsePrefix("8.8.8.8/32")),
+		WithBlockedPrefixes(blockedPublic),
+	})
+	require.False(t, cfg.isBlockedAddr(netip.MustParseAddr("8.8.8.8")))
+
+	cfg = newConfig([]Option{
+		WithBlockedPrefixes(netip.MustParsePrefix("::ffff:8.8.8.0/120")),
+	})
+	require.True(t, cfg.isBlockedAddr(netip.MustParseAddr("8.8.8.8")))
+	require.True(t, cfg.isBlockedAddr(netip.MustParseAddr("::ffff:8.8.8.8")))
+
+	require.PanicsWithValue(t,
+		"safedial: blocked prefix \"::ffff:0.0.0.0/95\": IPv4-mapped IPv6 prefix length must be at least 96 bits",
+		func() { WithBlockedPrefixes(netip.MustParsePrefix("::ffff:0.0.0.0/95")) },
+	)
+
+	// An invalid prefix contains no addresses; silently accepting it would
+	// turn the deny rule into a no-op, so it must panic instead.
+	require.PanicsWithValue(t,
+		"safedial: blocked prefix \"invalid Prefix\": prefix is not valid",
+		func() { WithBlockedPrefixes(netip.Prefix{}) },
+	)
+	require.PanicsWithValue(t,
+		"safedial: blocked prefix \"invalid Prefix\": prefix is not valid",
+		func() { WithBlockedPrefixes(netip.PrefixFrom(netip.MustParseAddr("10.0.0.0"), 64)) },
+	)
+
+	err := CheckAddr(netip.MustParseAddr("8.8.8.8"), WithBlockedPrefixes(blockedPublic))
+	var blockedErr *BlockedError
+	require.ErrorAs(t, err, &blockedErr)
+	require.Equal(t, netip.MustParseAddr("8.8.8.8"), blockedErr.Addr)
+}
+
+func TestWithBlockedPrefixesOuterNAT64(t *testing.T) {
+	t.Parallel()
+
+	// Blocking a translator's own range must block the translator itself:
+	// the outer form is matched before the embedded IPv4 is decoded, even
+	// when the embedded destination is public or explicitly allowed.
+	outer := netip.MustParseAddr("64:ff9b::808:808")
+	cfg := newConfig([]Option{
+		WithBlockedPrefixes(netip.MustParsePrefix("64:ff9b::/96")),
+	})
+	bad, blocked := cfg.blockedAddr(outer)
+	require.True(t, blocked)
+	require.Equal(t, outer, bad)
+	// The embedded destination stays reachable directly.
+	require.False(t, cfg.isBlockedAddr(netip.MustParseAddr("8.8.8.8")))
+
+	cfg = newConfig([]Option{
+		WithBlockedPrefixes(netip.MustParsePrefix("64:ff9b::/96")),
+		WithAllowedPrefixes(netip.MustParsePrefix("8.8.8.0/24")),
+	})
+	require.True(t, cfg.isBlockedAddr(outer))
+	require.False(t, cfg.isBlockedAddr(netip.MustParseAddr("8.8.8.8")))
+
+	// Same for operator-declared RFC 8215 prefixes.
+	nat64 := netip.MustParsePrefix("2001:db8:122:344::/64")
+	cfg = newConfig([]Option{
+		WithNAT64Prefixes(nat64),
+		WithBlockedPrefixes(nat64),
+	})
+	require.True(t, cfg.isBlockedAddr(netip.MustParseAddr("2001:db8:122:344:8:808:800:0")))
+	require.False(t, cfg.isBlockedAddr(netip.MustParseAddr("8.8.8.8")))
+
+	// A caller block on the embedded range still applies after decoding.
+	cfg = newConfig([]Option{
+		WithNAT64Prefixes(nat64),
+		WithBlockedPrefixes(netip.MustParsePrefix("8.8.8.0/24")),
+	})
+	bad, blocked = cfg.blockedAddr(netip.MustParseAddr("2001:db8:122:344:8:808:800:0"))
+	require.True(t, blocked)
+	require.Equal(t, netip.MustParseAddr("8.8.8.8"), bad)
 }
 
 func TestParseNAT64Prefix(t *testing.T) {
@@ -552,6 +637,385 @@ func TestDialAttemptDeadline(t *testing.T) {
 			require.Equal(t, now.Add(tc.want), got)
 		})
 	}
+}
+
+func startAcceptingListener(t *testing.T) (net.Listener, string, <-chan struct{}) {
+	t.Helper()
+
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, listener.Close()) })
+	_, port, err := net.SplitHostPort(listener.Addr().String())
+	require.NoError(t, err)
+	accepted := make(chan struct{}, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		_ = conn.Close()
+		accepted <- struct{}{}
+	}()
+	return listener, port, accepted
+}
+
+func TestGuardDialerControl(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name            string
+		address         string
+		opts            []Option
+		wantBlocked     bool
+		wantAddr        string
+		wantPortBlocked bool
+		wantPort        uint16
+		wantErr         string
+	}{
+		{name: "BlockedLiteral", address: "10.0.0.1:80", wantBlocked: true, wantAddr: "10.0.0.1"},
+		{name: "PublicLiteral", address: "8.8.8.8:80"},
+		{
+			name:    "AllowlistCarveOut",
+			address: "10.0.0.1:80",
+			opts: []Option{
+				WithAllowedPrefixes(netip.MustParsePrefix("10.0.0.0/8")),
+			},
+		},
+		{
+			name:        "NAT64EmbeddedPrivate",
+			address:     "[64:ff9b::a00:1]:80",
+			wantBlocked: true,
+			wantAddr:    "10.0.0.1",
+		},
+		{name: "MalformedAddress", address: "not-an-address", wantErr: "split connect address"},
+		{name: "HostnameFailsClosed", address: "example.com:80", wantErr: "parse connect address"},
+		{
+			name:            "PortBlocked",
+			address:         "8.8.8.8:80",
+			opts:            []Option{WithAllowedPorts(443)},
+			wantPortBlocked: true,
+			wantPort:        80,
+		},
+		{
+			name:    "PortAllowed",
+			address: "8.8.8.8:443",
+			opts:    []Option{WithAllowedPorts(443)},
+		},
+		{
+			name:    "PortUnrestrictedByDefault",
+			address: "8.8.8.8:65000",
+		},
+		{
+			name:    "MalformedPortFailsClosed",
+			address: "8.8.8.8:http",
+			opts:    []Option{WithAllowedPorts(80)},
+			wantErr: "parse connect port",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			guarded := newConfig(tc.opts).guardDialer(&net.Dialer{})
+			err := guarded.ControlContext(t.Context(), "tcp", tc.address, nil)
+			if tc.wantBlocked {
+				var blockedErr *BlockedError
+				require.ErrorAs(t, err, &blockedErr)
+				require.Equal(t, netip.MustParseAddr(tc.wantAddr), blockedErr.Addr)
+				return
+			}
+			if tc.wantPortBlocked {
+				var portErr *PortBlockedError
+				require.ErrorAs(t, err, &portErr)
+				require.Equal(t, tc.wantPort, portErr.Port)
+				return
+			}
+			if tc.wantErr != "" {
+				require.ErrorContains(t, err, tc.wantErr)
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
+
+	t.Run("CallerHooks", func(t *testing.T) {
+		t.Parallel()
+
+		errControl := errors.New("control stopped")
+		errControlContext := errors.New("control context stopped")
+		cases := []struct {
+			name              string
+			address           string
+			setControl        bool
+			setControlContext bool
+			wantErr           error
+			wantControlCalls  int
+			wantContextCalls  int
+			wantPolicyBlocked bool
+		}{
+			{
+				name:             "Control",
+				address:          "8.8.8.8:80",
+				setControl:       true,
+				wantErr:          errControl,
+				wantControlCalls: 1,
+			},
+			{
+				name:              "ControlContext",
+				address:           "8.8.8.8:80",
+				setControlContext: true,
+				wantErr:           errControlContext,
+				wantContextCalls:  1,
+			},
+			{
+				name:              "ControlContextWins",
+				address:           "8.8.8.8:80",
+				setControl:        true,
+				setControlContext: true,
+				wantErr:           errControlContext,
+				wantContextCalls:  1,
+			},
+			{
+				name:              "BlockedSkipsHooks",
+				address:           "10.0.0.1:80",
+				setControl:        true,
+				setControlContext: true,
+				wantPolicyBlocked: true,
+			},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+
+				controlCalls := 0
+				contextCalls := 0
+				base := &net.Dialer{}
+				if tc.setControl {
+					base.Control = func(_, _ string, _ syscall.RawConn) error {
+						controlCalls++
+						return errControl
+					}
+				}
+				if tc.setControlContext {
+					base.ControlContext = func(context.Context, string, string, syscall.RawConn) error {
+						contextCalls++
+						return errControlContext
+					}
+				}
+				guarded := newConfig(nil).guardDialer(base)
+				err := guarded.ControlContext(t.Context(), "tcp", tc.address, nil)
+				if tc.wantPolicyBlocked {
+					var blockedErr *BlockedError
+					require.ErrorAs(t, err, &blockedErr)
+				} else {
+					require.ErrorIs(t, err, tc.wantErr)
+				}
+				require.Equal(t, tc.wantControlCalls, controlCalls)
+				require.Equal(t, tc.wantContextCalls, contextCalls)
+			})
+		}
+	})
+}
+
+func TestGuardDialerBlocksUnvalidatedAddress(t *testing.T) {
+	t.Parallel()
+
+	_, port, accepted := startAcceptingListener(t)
+	guarded := newConfig(nil).guardDialer(defaultDialer())
+	conn, err := dialValidatedIPs(
+		testContext(t, testWait),
+		guarded,
+		"tcp4",
+		port,
+		[]netip.Addr{netip.MustParseAddr("127.0.0.1")},
+	)
+	if conn != nil {
+		_ = conn.Close()
+	}
+	require.Nil(t, conn)
+	var blockedErr *BlockedError
+	require.ErrorAs(t, err, &blockedErr)
+	var opErr *net.OpError
+	require.ErrorAs(t, err, &opErr)
+	select {
+	case <-accepted:
+		t.Fatal("blocked address connected")
+	default:
+	}
+}
+
+func TestGuardDialerBlocksUnvalidatedPort(t *testing.T) {
+	t.Parallel()
+
+	// Simulate a port-pinning regression by handing the guarded dialer a
+	// port the allowlist rejects: the connect-time backstop must fail
+	// closed before the socket connects.
+	_, port, accepted := startAcceptingListener(t)
+	cfg := newConfig([]Option{
+		WithAllowedPrefixes(allowOnly127001...),
+		WithAllowedPorts(1),
+	})
+	guarded := cfg.guardDialer(defaultDialer())
+	conn, err := dialValidatedIPs(
+		testContext(t, testWait),
+		guarded,
+		"tcp4",
+		port,
+		[]netip.Addr{netip.MustParseAddr("127.0.0.1")},
+	)
+	if conn != nil {
+		_ = conn.Close()
+	}
+	require.Nil(t, conn)
+	var portErr *PortBlockedError
+	require.ErrorAs(t, err, &portErr)
+	require.Equal(t, netip.MustParseAddrPort(net.JoinHostPort("127.0.0.1", port)).Port(), portErr.Port)
+	var opErr *net.OpError
+	require.ErrorAs(t, err, &opErr)
+	select {
+	case <-accepted:
+		t.Fatal("blocked port connected")
+	default:
+	}
+}
+
+func TestGuardDialerAllowsAllowlistedAddress(t *testing.T) {
+	t.Parallel()
+
+	listener, _, accepted := startAcceptingListener(t)
+	dial := NewDialContext(nil, WithAllowedPrefixes(allowOnly127001...))
+	conn, err := dial(testContext(t, testWait), "tcp4", listener.Addr().String())
+	require.NoError(t, err)
+	require.NoError(t, conn.Close())
+	select {
+	case <-accepted:
+	case <-time.After(testWait):
+		t.Fatal("timed out waiting for connection")
+	}
+}
+
+func TestWithAllowedPorts(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		opts func(uint16) []Option
+	}{
+		{name: "UnrestrictedByDefault", opts: func(uint16) []Option { return nil }},
+		{
+			name: "AllowedPort",
+			opts: func(port uint16) []Option { return []Option{WithAllowedPorts(port)} },
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			listener, _, accepted := startAcceptingListener(t)
+			port := netip.MustParseAddrPort(listener.Addr().String()).Port()
+			opts := append([]Option{WithAllowedPrefixes(allowOnly127001...)}, tc.opts(port)...)
+			dial := NewDialContext(nil, opts...)
+			conn, err := dial(testContext(t, testWait), "tcp4", listener.Addr().String())
+			require.NoError(t, err)
+			require.NoError(t, conn.Close())
+			select {
+			case <-accepted:
+			case <-time.After(testWait):
+				t.Fatal("timed out waiting for connection")
+			}
+		})
+	}
+
+	t.Run("BlockedBeforeConnection", func(t *testing.T) {
+		t.Parallel()
+
+		listener, _, accepted := startAcceptingListener(t)
+		dial := NewDialContext(nil,
+			WithAllowedPrefixes(allowOnly127001...),
+			WithAllowedPorts(443),
+		)
+		conn, err := dial(testContext(t, testWait), "tcp4", listener.Addr().String())
+		require.Nil(t, conn)
+		var portErr *PortBlockedError
+		require.ErrorAs(t, err, &portErr)
+		require.Equal(t, netip.MustParseAddrPort(listener.Addr().String()).Port(), portErr.Port)
+		select {
+		case <-accepted:
+			t.Fatal("blocked port connected")
+		case <-time.After(100 * time.Millisecond):
+		}
+	})
+
+	t.Run("ServiceNameAllowed", func(t *testing.T) {
+		t.Parallel()
+
+		errResolver := errors.New("resolver consulted")
+		var resolverCalls atomic.Int64
+		base := &net.Dialer{
+			Resolver: &net.Resolver{
+				PreferGo: true,
+				Dial: func(context.Context, string, string) (net.Conn, error) {
+					resolverCalls.Add(1)
+					return nil, errResolver
+				},
+			},
+		}
+		dial := NewDialContext(base, WithAllowedPorts(80))
+		conn, err := dial(testContext(t, testWait), "tcp", "port-probe.test:http")
+		require.Nil(t, conn)
+		require.ErrorContains(t, err, errResolver.Error())
+		var portErr *PortBlockedError
+		require.False(t, errors.As(err, &portErr))
+		require.Positive(t, resolverCalls.Load())
+	})
+
+	t.Run("BlockedServiceNamePrecedesResolution", func(t *testing.T) {
+		t.Parallel()
+
+		var resolverCalls atomic.Int64
+		base := &net.Dialer{
+			Resolver: &net.Resolver{
+				PreferGo: true,
+				Dial: func(context.Context, string, string) (net.Conn, error) {
+					resolverCalls.Add(1)
+					return nil, errors.New("resolver must not be consulted")
+				},
+			},
+		}
+		dial := NewDialContext(base, WithAllowedPorts(80))
+		conn, err := dial(testContext(t, testWait), "tcp", "port-probe.test:https")
+		require.Nil(t, conn)
+		var portErr *PortBlockedError
+		require.ErrorAs(t, err, &portErr)
+		require.Equal(t, uint16(443), portErr.Port)
+		require.Zero(t, resolverCalls.Load())
+	})
+
+	t.Run("ServiceNamePinnedNumeric", func(t *testing.T) {
+		t.Parallel()
+
+		// The validated numeric port must replace a service name before
+		// the downstream dialer sees the address: a dialer resolving the
+		// name itself could reach a different port than the one checked.
+		errProbe := errors.New("dial probe")
+		var got []string
+		base := dialerFunc(func(_ context.Context, _, addr string) (net.Conn, error) {
+			got = append(got, addr)
+			return nil, errProbe
+		})
+		dial := NewDialContext(base, WithAllowedPorts(80))
+		conn, err := dial(testContext(t, testWait), "tcp", "8.8.8.8:http")
+		require.Nil(t, conn)
+		require.ErrorIs(t, err, errProbe)
+		require.Equal(t, []string{"8.8.8.8:80"}, got)
+	})
+}
+
+// dialerFunc adapts a function to ContextDialer for observing the address a
+// guarded dial hands to its base dialer.
+type dialerFunc func(ctx context.Context, network, addr string) (net.Conn, error)
+
+func (f dialerFunc) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	return f(ctx, network, addr)
 }
 
 func TestDialValidatedIPs(t *testing.T) {
